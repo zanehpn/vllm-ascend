@@ -30,6 +30,58 @@ HALF_HEAD_DIM: tl.constexpr = 64
 
 
 @triton.jit
+def qknorm_rope_kv_kernel(
+    qkv_ptr,
+    k_weight_ptr,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    key_ptr,
+    value_ptr,
+    seq_len: tl.constexpr,
+    q_hidden_size: tl.constexpr,
+    kv_hidden_size: tl.constexpr,
+    total_hidden_size: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    eps: tl.constexpr,
+):
+    program_id = tl.program_id(0)
+    token = program_id // num_kv_heads
+    kv_head = program_id % num_kv_heads
+    dims = tl.arange(0, HEAD_DIM)
+    half_dims = dims % HALF_HEAD_DIM
+    valid = token < seq_len
+    k_base = token * total_hidden_size + q_hidden_size + kv_head * HEAD_DIM
+
+    k_raw = tl.load(qkv_ptr + k_base + dims, mask=valid, other=0.0).to(tl.float32)
+    k_inv_rms = 1.0 / tl.sqrt(tl.sum(k_raw * k_raw, axis=0) / HEAD_DIM + eps)
+    k_first = (
+        tl.load(qkv_ptr + k_base + half_dims, mask=valid, other=0.0).to(tl.float32)
+        * k_inv_rms
+        * tl.load(k_weight_ptr + half_dims).to(tl.float32)
+    ).to(tl.bfloat16)
+    k_second = (
+        tl.load(qkv_ptr + k_base + half_dims + HALF_HEAD_DIM, mask=valid, other=0.0).to(tl.float32)
+        * k_inv_rms
+        * tl.load(k_weight_ptr + half_dims + HALF_HEAD_DIM).to(tl.float32)
+    ).to(tl.bfloat16)
+    position = tl.load(positions_ptr + token, mask=valid, other=0)
+    rope_base = position * HEAD_DIM + half_dims
+    cosine = tl.load(cos_sin_cache_ptr + rope_base, mask=valid, other=0.0).to(tl.float32)
+    sine = tl.load(cos_sin_cache_ptr + rope_base + HALF_HEAD_DIM, mask=valid, other=0.0).to(tl.float32)
+    key = tl.where(
+        dims < HALF_HEAD_DIM,
+        k_first * cosine - k_second * sine,
+        k_second * cosine + k_first * sine,
+    ).to(tl.bfloat16)
+
+    output_base = (token * num_kv_heads + kv_head) * HEAD_DIM
+    value_base = token * total_hidden_size + q_hidden_size + kv_hidden_size + kv_head * HEAD_DIM
+    value = tl.load(qkv_ptr + value_base + dims, mask=valid, other=0.0)
+    tl.store(key_ptr + output_base + dims, key, mask=valid)
+    tl.store(value_ptr + output_base + dims, value, mask=valid)
+
+
+@triton.jit
 def qknorm_rope_prefill_attention_kernel(
     qkv_ptr,
     q_weight_ptr,
@@ -356,6 +408,60 @@ def qknorm_rope_prefill_attention_with_cache_fake(
     )
 
 
+def qknorm_rope_kv_impl(
+    qkv: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    num_query_heads: int,
+    num_kv_heads: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q_hidden_size = num_query_heads * HEAD_DIM
+    kv_hidden_size = num_kv_heads * HEAD_DIM
+    total_hidden_size = q_hidden_size + 2 * kv_hidden_size
+    if qkv.dtype != torch.bfloat16 or qkv.ndim != 2:
+        raise ValueError("qkv must be a 2D bfloat16 tensor")
+    if qkv.shape[1] != total_hidden_size:
+        raise ValueError(f"qkv hidden size must be {total_hidden_size}")
+    key = torch.empty((qkv.shape[0], num_kv_heads, HEAD_DIM), dtype=qkv.dtype, device=qkv.device)
+    value = torch.empty_like(key)
+    grid = (qkv.shape[0] * num_kv_heads, 1, 1)
+    qknorm_rope_kv_kernel[grid](
+        qkv,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        key,
+        value,
+        qkv.shape[0],
+        q_hidden_size,
+        kv_hidden_size,
+        total_hidden_size,
+        num_kv_heads,
+        eps,
+        num_warps=4,
+        num_stages=1,
+    )
+    return key, value
+
+
+def qknorm_rope_kv_fake(
+    qkv: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    num_query_heads: int,
+    num_kv_heads: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del k_weight, cos_sin_cache, positions, num_query_heads, eps
+    shape = (qkv.shape[0], num_kv_heads, HEAD_DIM)
+    return torch.empty(shape, dtype=qkv.dtype, device=qkv.device), torch.empty(
+        shape, dtype=qkv.dtype, device=qkv.device
+    )
+
+
 def qknorm_rope_prefill_attention_fake(
     qkv: torch.Tensor,
     q_weight: torch.Tensor,
@@ -379,6 +485,14 @@ direct_register_custom_op(
     op_name="qknorm_rope_prefill_attention",
     op_func=qknorm_rope_prefill_attention_impl,
     fake_impl=qknorm_rope_prefill_attention_fake,
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
+
+direct_register_custom_op(
+    op_name="qknorm_rope_kv",
+    op_func=qknorm_rope_kv_impl,
+    fake_impl=qknorm_rope_kv_fake,
     mutates_args=[],
     dispatch_key="PrivateUse1",
 )

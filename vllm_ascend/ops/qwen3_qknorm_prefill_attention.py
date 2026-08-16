@@ -6,6 +6,7 @@ import os
 
 import torch
 import torch.nn.functional as F
+import torch_npu
 from vllm.forward_context import get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -228,6 +229,40 @@ def qwen3_qknorm_prefill_attention_impl(
             ):
                 direct_key_snapshot = key_cache.view(-1, num_kv_heads, head_dim)[cache_slots].clone()
                 direct_value_snapshot = value_cache.view(-1, num_kv_heads, head_dim)[cache_slots].clone()
+            fia_probe = os.getenv("VLLM_ASCEND_QKNORM_FIA_PROBE", "kv_only_tiny_fia")
+            if fia_probe == "kv_only_tiny_fia":
+                key, value = torch.ops.vllm.qknorm_rope_kv(
+                    qkv,
+                    k_weight,
+                    cos_sin_cache,
+                    positions,
+                    num_query_heads,
+                    num_kv_heads,
+                    eps,
+                )
+                attention_layer.impl.reshape_and_cache(
+                    fused_snapshot,
+                    key,
+                    value,
+                    attention_layer.kv_cache,
+                    metadata,
+                    torch.empty_like(fused_snapshot),
+                )
+                tiny_q = torch.zeros((1, num_query_heads, head_dim), dtype=qkv.dtype, device=qkv.device)
+                tiny_kv = torch.zeros((1, num_kv_heads, head_dim), dtype=qkv.dtype, device=qkv.device)
+                torch_npu.npu_fused_infer_attention_score(
+                    query=tiny_q,
+                    key=tiny_kv,
+                    value=tiny_kv,
+                    input_layout="TND",
+                    actual_seq_lengths=[1],
+                    actual_seq_lengths_kv=[1],
+                    num_key_value_heads=num_kv_heads,
+                    num_heads=num_query_heads,
+                    scale=scale,
+                    sparse_mode=0,
+                )
+                return fused_snapshot.view(qkv.shape[0], q_hidden_size)
             query, key, value = DeviceOperator.split_qkv_rmsnorm_rope(
                 input=qkv,
                 q_weight=q_weight,
@@ -241,7 +276,81 @@ def qwen3_qknorm_prefill_attention_impl(
                 cos_sin_cache=cos_sin_cache,
                 positions=positions,
             )
-            baseline_output = attention_layer(query, key, value)
+            if fia_probe == "scatter_tiny_fia":
+                attention_layer.impl.reshape_and_cache(
+                    query.view(qkv.shape[0], num_query_heads, head_dim),
+                    key.view(qkv.shape[0], num_kv_heads, head_dim),
+                    value.view(qkv.shape[0], num_kv_heads, head_dim),
+                    attention_layer.kv_cache,
+                    metadata,
+                    torch.empty_like(fused_snapshot),
+                )
+                tiny_q = torch.zeros((1, num_query_heads, head_dim), dtype=qkv.dtype, device=qkv.device)
+                tiny_kv = torch.zeros((1, num_kv_heads, head_dim), dtype=qkv.dtype, device=qkv.device)
+                torch_npu.npu_fused_infer_attention_score(
+                    query=tiny_q,
+                    key=tiny_kv,
+                    value=tiny_kv,
+                    input_layout="TND",
+                    actual_seq_lengths=[1],
+                    actual_seq_lengths_kv=[1],
+                    num_key_value_heads=num_kv_heads,
+                    num_heads=num_query_heads,
+                    scale=scale,
+                    sparse_mode=0,
+                )
+                return fused_snapshot.view(qkv.shape[0], q_hidden_size)
+            if fia_probe == "scatter_fia_zero":
+                attention_layer.impl.reshape_and_cache(
+                    query.view(qkv.shape[0], num_query_heads, head_dim),
+                    key.view(qkv.shape[0], num_kv_heads, head_dim),
+                    value.view(qkv.shape[0], num_kv_heads, head_dim),
+                    attention_layer.kv_cache,
+                    metadata,
+                    torch.empty_like(fused_snapshot),
+                )
+                attention_layer.impl.forward_fused_infer_attention(
+                    torch.zeros_like(query).view(qkv.shape[0], num_query_heads, head_dim),
+                    torch.zeros_like(key).view(qkv.shape[0], num_kv_heads, head_dim),
+                    torch.zeros_like(value).view(qkv.shape[0], num_kv_heads, head_dim),
+                    metadata,
+                    torch.empty_like(fused_snapshot),
+                    attention_layer.kv_cache,
+                )
+                return fused_snapshot.view(qkv.shape[0], q_hidden_size)
+            if fia_probe == "fia_only":
+                attention_layer.impl.forward_fused_infer_attention(
+                    torch.zeros_like(query).view(qkv.shape[0], num_query_heads, head_dim),
+                    torch.zeros_like(key).view(qkv.shape[0], num_kv_heads, head_dim),
+                    torch.zeros_like(value).view(qkv.shape[0], num_kv_heads, head_dim),
+                    metadata,
+                    torch.empty_like(fused_snapshot),
+                    attention_layer.kv_cache,
+                )
+                return fused_snapshot.view(qkv.shape[0], q_hidden_size)
+            if fia_probe == "matmul":
+                attention_layer.impl.reshape_and_cache(
+                    query.view(qkv.shape[0], num_query_heads, head_dim),
+                    key.view(qkv.shape[0], num_kv_heads, head_dim),
+                    value.view(qkv.shape[0], num_kv_heads, head_dim),
+                    attention_layer.kv_cache,
+                    metadata,
+                    torch.empty_like(fused_snapshot),
+                )
+                lhs = torch.zeros((16, head_dim), dtype=qkv.dtype, device=qkv.device)
+                rhs = torch.zeros((head_dim, 16), dtype=qkv.dtype, device=qkv.device)
+                torch.matmul(lhs, rhs)
+                torch.npu.synchronize()
+                return fused_snapshot.view(qkv.shape[0], q_hidden_size)
+            if fia_probe == "clone":
+                fia_query, fia_key, fia_value = query.clone(), key.clone(), value.clone()
+            elif fia_probe == "zero":
+                fia_query = torch.zeros_like(query)
+                fia_key = torch.zeros_like(key)
+                fia_value = torch.zeros_like(value)
+            else:
+                fia_query, fia_key, fia_value = query, key, value
+            baseline_output = attention_layer(fia_query, fia_key, fia_value)
             if isolate_cache_write and not envs.VLLM_ASCEND_QKNORM_PREFILL_DIAGNOSTIC:
                 return fused_snapshot.view(qkv.shape[0], q_hidden_size)
             if direct_key_snapshot is not None and direct_value_snapshot is not None:

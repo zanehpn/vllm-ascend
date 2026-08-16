@@ -156,3 +156,34 @@ def test_qknorm_rope_prefill_attention_writes_paged_kv_cache():
     torch.testing.assert_close(flat_v[slot_mapping.long()], expected_v, rtol=0, atol=0)
     assert torch.count_nonzero(flat_k[seq_len:]).item() == 0
     assert torch.count_nonzero(flat_v[seq_len:]).item() == 0
+
+
+def test_qknorm_rope_kv_matches_reference():
+    torch.manual_seed(23)
+    device = torch.device("npu")
+    seq_len, num_query_heads, num_kv_heads = 17, 16, 8
+    q_size = num_query_heads * HEAD_DIM
+    kv_size = num_kv_heads * HEAD_DIM
+    qkv = torch.randn(seq_len, q_size + 2 * kv_size, dtype=torch.bfloat16, device=device)
+    k_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(seq_len, dtype=torch.int64, device=device)
+    angles = torch.randn(seq_len, HEAD_DIM // 2, dtype=torch.float32, device=device)
+    cos_sin_cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(torch.bfloat16)
+
+    key, value = torch.ops.vllm.qknorm_rope_kv(
+        qkv, k_weight, cos_sin_cache, positions, num_query_heads, num_kv_heads, 1e-6
+    )
+    _, raw_key, expected_value = qkv.split((q_size, kv_size, kv_size), dim=-1)
+    raw_key = raw_key.view(seq_len, num_kv_heads, HEAD_DIM).float()
+    expected_key = (
+        raw_key * torch.rsqrt(raw_key.square().mean(dim=-1, keepdim=True) + 1e-6) * k_weight.float()
+    ).to(torch.bfloat16).float()
+    cos, sin = cos_sin_cache[positions].float().chunk(2, dim=-1)
+    first, second = expected_key.chunk(2, dim=-1)
+    expected_key = torch.cat(
+        (first * cos[:, None] - second * sin[:, None], second * cos[:, None] + first * sin[:, None]),
+        dim=-1,
+    ).to(torch.bfloat16)
+
+    torch.testing.assert_close(key, expected_key, rtol=0, atol=0)
+    torch.testing.assert_close(value, expected_value.view_as(value), rtol=0, atol=0)
