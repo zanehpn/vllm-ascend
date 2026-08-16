@@ -61,18 +61,12 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
                 cos_sin_cache = cos_sin_cache.to(qkv.device)
             if cos_sin_cache.dtype != qkv.dtype:
                 cos_sin_cache = cos_sin_cache.to(qkv.dtype)
-            attn_output = torch.empty(
-                (qkv.shape[0], self.q_size),
-                dtype=qkv.dtype,
-                device=qkv.device,
-            )
-            torch.ops.vllm.qwen3_qknorm_prefill_attention(
+            attn_output = torch.ops.vllm.qwen3_qknorm_prefill_attention(
                 qkv,
                 self.q_norm.weight,
                 self.k_norm.weight,
                 cos_sin_cache,
                 positions,
-                attn_output,
                 self.attn.layer_name,
                 self.num_heads,
                 self.num_kv_heads,

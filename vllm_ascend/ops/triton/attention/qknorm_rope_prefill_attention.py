@@ -37,6 +37,9 @@ def qknorm_rope_prefill_attention_kernel(
     cos_sin_cache_ptr,
     positions_ptr,
     output_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    slot_mapping_ptr,
     seq_len: tl.constexpr,
     q_hidden_size: tl.constexpr,
     kv_hidden_size: tl.constexpr,
@@ -47,6 +50,7 @@ def qknorm_rope_prefill_attention_kernel(
     softmax_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    STORE_CACHE: tl.constexpr,
 ):
     program_id = tl.program_id(0)
     query_block = program_id // num_query_heads
@@ -178,6 +182,25 @@ def qknorm_rope_prefill_attention_kernel(
             mask=col_mask[:, None],
             other=0.0,
         )
+        if STORE_CACHE:
+            # The cache layout is [num_blocks, block_size, KV heads, D].
+            # A flattened slot therefore addresses one [KV heads, D] row.
+            # Only the first query block and one query head per GQA group
+            # publish this KV head, so every cache element has one writer.
+            slots = tl.load(slot_mapping_ptr + cols, mask=col_mask, other=-1)
+            cache_mask = (
+                col_mask[:, None]
+                & (slots[:, None] >= 0)
+                & (query_block == 0)
+                & ((query_head % kv_group_size) == 0)
+            )
+            cache_offset = (
+                slots[:, None] * num_kv_heads * HEAD_DIM
+                + kv_head * HEAD_DIM
+                + dims[None, :]
+            )
+            tl.store(key_cache_ptr + cache_offset, k, mask=cache_mask)
+            tl.store(value_cache_ptr + cache_offset, value, mask=cache_mask)
         accumulator = accumulator * correction[:, None] + tl.dot(
             probabilities.to(tl.bfloat16), value, input_precision="ieee"
         )
@@ -234,6 +257,9 @@ def qknorm_rope_prefill_attention_impl(
         cos_sin_cache,
         positions,
         output,
+        qkv,
+        qkv,
+        positions,
         seq_len,
         q_hidden_size,
         kv_hidden_size,
@@ -244,10 +270,90 @@ def qknorm_rope_prefill_attention_impl(
         scale,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        STORE_CACHE=False,
         num_warps=4,
         num_stages=2,
     )
     return output
+
+
+def qknorm_rope_prefill_attention_with_cache_impl(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    num_query_heads: int,
+    num_kv_heads: int,
+    eps: float,
+    scale: float,
+) -> torch.Tensor:
+    q_hidden_size = num_query_heads * HEAD_DIM
+    kv_hidden_size = num_kv_heads * HEAD_DIM
+    expected_hidden_size = q_hidden_size + 2 * kv_hidden_size
+    if qkv.dtype != torch.bfloat16 or key_cache.dtype != qkv.dtype or value_cache.dtype != qkv.dtype:
+        raise ValueError("QKV and KV cache must be bfloat16")
+    if slot_mapping.ndim != 1 or slot_mapping.shape[0] < qkv.shape[0]:
+        raise ValueError("slot_mapping must contain one slot per token")
+    if key_cache.numel() != value_cache.numel():
+        raise ValueError("key and value caches must have equal size")
+
+    seq_len = qkv.shape[0]
+    output = torch.empty(
+        (seq_len, num_query_heads, HEAD_DIM), dtype=qkv.dtype, device=qkv.device
+    )
+    block_m = 16
+    block_n = 32
+    grid = (triton.cdiv(seq_len, block_m) * num_query_heads, 1, 1)
+    qknorm_rope_prefill_attention_kernel[grid](
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        output,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        seq_len,
+        q_hidden_size,
+        kv_hidden_size,
+        expected_hidden_size,
+        num_query_heads,
+        num_kv_heads,
+        eps,
+        scale,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        STORE_CACHE=True,
+        num_warps=4,
+        num_stages=2,
+    )
+    return output
+
+
+def qknorm_rope_prefill_attention_with_cache_fake(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    num_query_heads: int,
+    num_kv_heads: int,
+    eps: float,
+    scale: float,
+) -> torch.Tensor:
+    del q_weight, k_weight, cos_sin_cache, positions, key_cache, value_cache
+    del slot_mapping, num_kv_heads, eps, scale
+    return torch.empty(
+        (qkv.shape[0], num_query_heads, HEAD_DIM), dtype=qkv.dtype, device=qkv.device
+    )
 
 
 def qknorm_rope_prefill_attention_fake(
@@ -274,6 +380,14 @@ direct_register_custom_op(
     op_func=qknorm_rope_prefill_attention_impl,
     fake_impl=qknorm_rope_prefill_attention_fake,
     mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
+
+direct_register_custom_op(
+    op_name="qknorm_rope_prefill_attention_with_cache",
+    op_func=qknorm_rope_prefill_attention_with_cache_impl,
+    fake_impl=qknorm_rope_prefill_attention_with_cache_fake,
+    mutates_args=["key_cache", "value_cache"],
     dispatch_key="PrivateUse1",
 )
 

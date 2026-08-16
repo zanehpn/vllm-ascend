@@ -88,3 +88,71 @@ def test_qknorm_rope_prefill_attention(seq_len: int, num_query_heads: int, num_k
         eps,
     )
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_qknorm_rope_prefill_attention_writes_paged_kv_cache():
+    torch.manual_seed(11)
+    device = torch.device("npu")
+    seq_len = 8
+    num_query_heads = 16
+    num_kv_heads = 8
+    q_size = num_query_heads * HEAD_DIM
+    kv_size = num_kv_heads * HEAD_DIM
+    qkv = torch.randn(seq_len, q_size + 2 * kv_size, dtype=torch.bfloat16, device=device)
+    q_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device)
+    k_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(seq_len, dtype=torch.int64, device=device)
+    angles = torch.randn(seq_len, HEAD_DIM // 2, dtype=torch.float32, device=device)
+    cos_sin_cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(torch.bfloat16)
+    slot_mapping = torch.arange(seq_len - 1, -1, -1, dtype=torch.int32, device=device)
+    key_cache = torch.zeros(2, 128, num_kv_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    value_cache = torch.zeros_like(key_cache)
+
+    actual = torch.ops.vllm.qknorm_rope_prefill_attention_with_cache(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        num_query_heads,
+        num_kv_heads,
+        1e-6,
+        1.0 / math.sqrt(HEAD_DIM),
+    )
+    expected_output = reference_attention(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        num_query_heads,
+        num_kv_heads,
+        1e-6,
+    )
+    torch.testing.assert_close(actual, expected_output, rtol=2e-2, atol=2e-2)
+
+    _, raw_k, expected_v = qkv.split((q_size, kv_size, kv_size), dim=-1)
+    raw_k = raw_k.view(seq_len, num_kv_heads, HEAD_DIM).float()
+    expected_k = (
+        raw_k * torch.rsqrt(raw_k.square().mean(dim=-1, keepdim=True) + 1e-6) * k_weight.float()
+    ).to(torch.bfloat16).float()
+    cos, sin = cos_sin_cache[positions].float().chunk(2, dim=-1)
+    first, second = expected_k.chunk(2, dim=-1)
+    expected_k = torch.cat(
+        (
+            first * cos[:, None] - second * sin[:, None],
+            second * cos[:, None] + first * sin[:, None],
+        ),
+        dim=-1,
+    ).to(torch.bfloat16)
+    expected_v = expected_v.view(seq_len, num_kv_heads, HEAD_DIM)
+
+    flat_k = key_cache.view(-1, num_kv_heads, HEAD_DIM)
+    flat_v = value_cache.view(-1, num_kv_heads, HEAD_DIM)
+    torch.testing.assert_close(flat_k[slot_mapping.long()], expected_k, rtol=0, atol=0)
+    torch.testing.assert_close(flat_v[slot_mapping.long()], expected_v, rtol=0, atol=0)
+    assert torch.count_nonzero(flat_k[seq_len:]).item() == 0
+    assert torch.count_nonzero(flat_v[seq_len:]).item() == 0

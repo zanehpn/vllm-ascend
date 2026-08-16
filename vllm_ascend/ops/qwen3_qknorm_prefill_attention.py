@@ -2,12 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Runtime dispatch for experimental Qwen3 non-materializing prefill."""
 
+import os
+
 import torch
 import torch.nn.functional as F
 from vllm.forward_context import get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.utils import notify_kv_cache_written
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend import envs
 
@@ -152,14 +155,13 @@ def qwen3_qknorm_prefill_attention_impl(
     k_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
-    output: torch.Tensor,
     layer_name: str,
     num_query_heads: int,
     num_kv_heads: int,
     head_dim: int,
     eps: float,
     scale: float,
-) -> None:
+) -> torch.Tensor:
     attention_layer, metadata = _get_attention_runtime(layer_name)
     q_hidden_size = num_query_heads * head_dim
     kv_hidden_size = num_kv_heads * head_dim
@@ -172,39 +174,86 @@ def qwen3_qknorm_prefill_attention_impl(
         num_query_heads,
         num_kv_heads,
         head_dim,
-    ):
-        fused_output = torch.ops.vllm.qknorm_rope_prefill_attention(
-            qkv,
-            q_weight,
-            k_weight,
-            cos_sin_cache,
-            positions,
-            num_query_heads,
-            num_kv_heads,
-            eps,
-            scale,
-        )
-        # Correctness scaffold: compute the established fused QK-Norm/RoPE +
-        # FIA path on the same inputs.  Until K/V cache writes are integrated
-        # into the experimental kernel, this path owns the externally visible
-        # output and cache side effects.  The experimental result is retained
-        # for layer-by-layer diagnostics only.
-        query, key, value = DeviceOperator.split_qkv_rmsnorm_rope(
-            input=qkv,
-            q_weight=q_weight,
-            k_weight=k_weight,
-            q_hidden_size=q_hidden_size,
-            kv_hidden_size=kv_hidden_size,
-            head_dim=head_dim,
-            eps=eps,
-            q_bias=None,
-            k_bias=None,
-            cos_sin_cache=cos_sin_cache,
-            positions=positions,
-        )
-        baseline_output = attention_layer(query, key, value)
-        if envs.VLLM_ASCEND_QKNORM_PREFILL_DIAGNOSTIC:
-            fused_flat = fused_output.view_as(baseline_output).float()
+    ) and len(attention_layer.kv_cache) > 1:
+        key_cache = attention_layer.kv_cache[0]
+        value_cache = attention_layer.kv_cache[1]
+        # The stock attention forward lazily binds these references during
+        # prefill.  Bypassing that forward must preserve the same state for
+        # subsequent decode steps.
+        if attention_layer.impl.key_cache is None:
+            attention_layer.impl.key_cache = key_cache
+            attention_layer.impl.value_cache = value_cache
+        isolate_cache_write = os.getenv("VLLM_ASCEND_QKNORM_UNSAFE_DIRECT_CACHE") != "1"
+        if isolate_cache_write:
+            fused_output = torch.ops.vllm.qknorm_rope_prefill_attention(
+                qkv,
+                q_weight,
+                k_weight,
+                cos_sin_cache,
+                positions,
+                num_query_heads,
+                num_kv_heads,
+                eps,
+                scale,
+            )
+        else:
+            fused_output = torch.ops.vllm.qknorm_rope_prefill_attention_with_cache(
+                qkv,
+                q_weight,
+                k_weight,
+                cos_sin_cache,
+                positions,
+                key_cache,
+                value_cache,
+                metadata.slot_mapping[: metadata.num_actual_tokens],
+                num_query_heads,
+                num_kv_heads,
+                eps,
+                scale,
+            )
+            # Keep the nested custom-op allocation alive across the outer
+            # runtime custom-op boundary.  This also isolates any output/cache
+            # aliasing introduced by PrivateUse1 custom-op functionalization.
+            fused_output = fused_output.clone()
+            notify_kv_cache_written(layer_name)
+        if envs.VLLM_ASCEND_QKNORM_PREFILL_DIAGNOSTIC or isolate_cache_write:
+            fused_snapshot = fused_output.clone()
+            torch.npu.synchronize()
+            cache_slots = metadata.slot_mapping[: metadata.num_actual_tokens]
+            direct_key_snapshot = None
+            direct_value_snapshot = None
+            if (
+                envs.VLLM_ASCEND_QKNORM_PREFILL_DIAGNOSTIC
+                and layer_name == "model.layers.0.self_attn.attn"
+            ):
+                direct_key_snapshot = key_cache.view(-1, num_kv_heads, head_dim)[cache_slots].clone()
+                direct_value_snapshot = value_cache.view(-1, num_kv_heads, head_dim)[cache_slots].clone()
+            query, key, value = DeviceOperator.split_qkv_rmsnorm_rope(
+                input=qkv,
+                q_weight=q_weight,
+                k_weight=k_weight,
+                q_hidden_size=q_hidden_size,
+                kv_hidden_size=kv_hidden_size,
+                head_dim=head_dim,
+                eps=eps,
+                q_bias=None,
+                k_bias=None,
+                cos_sin_cache=cos_sin_cache,
+                positions=positions,
+            )
+            baseline_output = attention_layer(query, key, value)
+            if isolate_cache_write and not envs.VLLM_ASCEND_QKNORM_PREFILL_DIAGNOSTIC:
+                return fused_snapshot.view(qkv.shape[0], q_hidden_size)
+            if direct_key_snapshot is not None and direct_value_snapshot is not None:
+                reference_key = key_cache.view(-1, num_kv_heads, head_dim)[cache_slots]
+                reference_value = value_cache.view(-1, num_kv_heads, head_dim)[cache_slots]
+                print(
+                    "QKNORM_CACHE_ERROR "
+                    f"key_max={(direct_key_snapshot.float() - reference_key.float()).abs().max().item():.8f} "
+                    f"value_max={(direct_value_snapshot.float() - reference_value.float()).abs().max().item():.8f}",
+                    flush=True,
+                )
+            fused_flat = fused_snapshot.view_as(baseline_output).float()
             baseline_fp32 = baseline_output.float()
             error = fused_flat - baseline_fp32
             print(
@@ -213,7 +262,8 @@ def qwen3_qknorm_prefill_attention_impl(
                 f"max_abs={error.abs().max().item():.8f} "
                 f"mean_abs={error.abs().mean().item():.8f} "
                 f"rmse={error.square().mean().sqrt().item():.8f} "
-                f"cosine={F.cosine_similarity(fused_flat.flatten(), baseline_fp32.flatten(), dim=0).item():.8f}",
+                f"cosine={F.cosine_similarity(fused_flat.flatten(), baseline_fp32.flatten(), dim=0).item():.8f} "
+                f"alias={fused_snapshot.data_ptr() == baseline_output.data_ptr()}",
                 flush=True,
             )
             if layer_name == "model.layers.0.self_attn.attn":
@@ -226,7 +276,7 @@ def qwen3_qknorm_prefill_attention_impl(
                     query,
                     key,
                     value,
-                    fused_output,
+                    fused_snapshot,
                     baseline_output,
                     num_query_heads,
                     num_kv_heads,
@@ -234,8 +284,8 @@ def qwen3_qknorm_prefill_attention_impl(
                     eps,
                     scale,
                 )
-        output.copy_(baseline_output.view_as(output))
-        return
+            return baseline_output
+        return fused_output.view(qkv.shape[0], q_hidden_size)
 
     query, key, value = DeviceOperator.split_qkv_rmsnorm_rope(
         input=qkv,
@@ -250,7 +300,7 @@ def qwen3_qknorm_prefill_attention_impl(
         cos_sin_cache=cos_sin_cache,
         positions=positions,
     )
-    output.copy_(attention_layer(query, key, value))
+    return attention_layer(query, key, value)
 
 
 def qwen3_qknorm_prefill_attention_fake(
@@ -259,21 +309,26 @@ def qwen3_qknorm_prefill_attention_fake(
     k_weight: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
-    output: torch.Tensor,
     layer_name: str,
     num_query_heads: int,
     num_kv_heads: int,
     head_dim: int,
     eps: float,
     scale: float,
-) -> None:
-    return
+) -> torch.Tensor:
+    del q_weight, k_weight, cos_sin_cache, positions, layer_name
+    del num_kv_heads, eps, scale
+    return torch.empty(
+        (qkv.shape[0], num_query_heads * head_dim),
+        dtype=qkv.dtype,
+        device=qkv.device,
+    )
 
 
 direct_register_custom_op(
     op_name="qwen3_qknorm_prefill_attention",
     op_func=qwen3_qknorm_prefill_attention_impl,
-    mutates_args=["output"],
+    mutates_args=[],
     fake_impl=qwen3_qknorm_prefill_attention_fake,
     dispatch_key="PrivateUse1",
 )
