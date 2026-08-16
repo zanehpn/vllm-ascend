@@ -51,7 +51,7 @@ def reference_attention(
     return torch.einsum("hts,shd->thd", probabilities, v).to(qkv.dtype)
 
 
-@pytest.mark.parametrize("seq_len", [17, 128])
+@pytest.mark.parametrize("seq_len", [8, 17, 128])
 @pytest.mark.parametrize("num_query_heads,num_kv_heads", [(16, 8), (32, 8)])
 def test_qknorm_rope_prefill_attention(seq_len: int, num_query_heads: int, num_kv_heads: int):
     torch.manual_seed(7)

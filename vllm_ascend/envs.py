@@ -100,6 +100,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Experimental, non-sensitive switch for the Qwen3 BF16/D128 single-sequence
+    # prefill attention kernel that consumes raw QKV without materializing Q/K.
+    # 0: use the existing QK-Norm/RoPE + FIA path; 1: enable the guarded path.
+    "VLLM_ASCEND_ENABLE_QKNORM_PREFILL_ATTENTION": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_QKNORM_PREFILL_ATTENTION", "0"))
+    ),
+    # Diagnostic mode: compare fused and FIA outputs layer by layer while
+    # forwarding the FIA result so errors do not accumulate across layers.
+    "VLLM_ASCEND_QKNORM_PREFILL_DIAGNOSTIC": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_QKNORM_PREFILL_DIAGNOSTIC", "0"))
+    ),
 }
 
 # end-env-vars-definition

@@ -9,6 +9,7 @@ from vllm.model_executor.models.qwen3_vl import (
 )
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend import envs
 from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding
 
 
@@ -54,6 +55,33 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
             rope_dim=self.rotary_emb.rotary_dim,
         )
     else:
+        if envs.VLLM_ASCEND_ENABLE_QKNORM_PREFILL_ATTENTION:
+            cos_sin_cache = self.rotary_emb.cos_sin_cache
+            if cos_sin_cache.device != qkv.device:
+                cos_sin_cache = cos_sin_cache.to(qkv.device)
+            if cos_sin_cache.dtype != qkv.dtype:
+                cos_sin_cache = cos_sin_cache.to(qkv.dtype)
+            attn_output = torch.empty(
+                (qkv.shape[0], self.q_size),
+                dtype=qkv.dtype,
+                device=qkv.device,
+            )
+            torch.ops.vllm.qwen3_qknorm_prefill_attention(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos_sin_cache,
+                positions,
+                attn_output,
+                self.attn.layer_name,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                self.scaling,
+            )
+            output, _ = self.o_proj(attn_output)
+            return output
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
         q_by_head = self.q_norm(q_by_head)

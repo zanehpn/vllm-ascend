@@ -74,8 +74,19 @@ def qknorm_rope_prefill_attention_kernel(
         mask=row_mask[:, None],
         other=0.0,
     ).to(tl.float32)
-    q_first *= tl.load(q_weight_ptr + half_dims)[None, :].to(tl.float32)
-    q_second *= tl.load(q_weight_ptr + half_dims + HALF_HEAD_DIM)[None, :].to(tl.float32)
+    # Match the established fused QK-Norm/RoPE numerical boundary: normalize
+    # and apply gamma in FP32, round to BF16, then rotate.  The values remain
+    # on chip; this does not materialize normalized Q/K in global memory.
+    q_first = (
+        q_first
+        * q_inv_rms[:, None]
+        * tl.load(q_weight_ptr + half_dims)[None, :].to(tl.float32)
+    ).to(tl.bfloat16)
+    q_second = (
+        q_second
+        * q_inv_rms[:, None]
+        * tl.load(q_weight_ptr + half_dims + HALF_HEAD_DIM)[None, :].to(tl.float32)
+    ).to(tl.bfloat16)
 
     q_positions = tl.load(positions_ptr + rows, mask=row_mask, other=0)
     q_cache_base = q_positions[:, None] * HEAD_DIM + half_dims[None, :]
@@ -90,7 +101,7 @@ def qknorm_rope_prefill_attention_kernel(
         q_first * q_cos - q_second * q_sin,
         q_second * q_cos + q_first * q_sin,
     )
-    q = (q_rotated * q_inv_rms[:, None]).to(tl.bfloat16)
+    q = q_rotated.to(tl.bfloat16)
 
     running_max = tl.full((BLOCK_M,), -float("inf"), tl.float32)
     running_sum = tl.zeros((BLOCK_M,), tl.float32)
@@ -115,8 +126,16 @@ def qknorm_rope_prefill_attention_kernel(
             mask=col_mask[:, None],
             other=0.0,
         ).to(tl.float32)
-        k_first *= tl.load(k_weight_ptr + half_dims)[None, :].to(tl.float32)
-        k_second *= tl.load(k_weight_ptr + half_dims + HALF_HEAD_DIM)[None, :].to(tl.float32)
+        k_first = (
+            k_first
+            * k_inv_rms[:, None]
+            * tl.load(k_weight_ptr + half_dims)[None, :].to(tl.float32)
+        ).to(tl.bfloat16)
+        k_second = (
+            k_second
+            * k_inv_rms[:, None]
+            * tl.load(k_weight_ptr + half_dims + HALF_HEAD_DIM)[None, :].to(tl.float32)
+        ).to(tl.bfloat16)
 
         k_positions = tl.load(positions_ptr + cols, mask=col_mask, other=0)
         k_cache_base = k_positions[:, None] * HEAD_DIM + half_dims[None, :]
@@ -131,10 +150,15 @@ def qknorm_rope_prefill_attention_kernel(
             k_first * k_cos - k_second * k_sin,
             k_second * k_cos + k_first * k_sin,
         )
-        k = (k_rotated * k_inv_rms[:, None]).to(tl.bfloat16)
+        k = k_rotated.to(tl.bfloat16)
 
         scores = tl.dot(q, tl.trans(k), input_precision="ieee") * softmax_scale
         causal_mask = col_mask[None, :] & row_mask[:, None] & (cols[None, :] <= rows[:, None])
+        # A partial query tile contains padding rows.  Leaving every score in
+        # such a row at -inf makes online softmax evaluate -inf - (-inf), and
+        # NaNs can contaminate valid rows inside the Cube tile.  Give padding
+        # rows one harmless sentinel key; their outputs are never stored.
+        causal_mask |= (~row_mask[:, None]) & (cols[None, :] == 0)
         scores = tl.where(causal_mask, scores, -float("inf"))
 
         block_max = tl.max(scores, axis=1)
