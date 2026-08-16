@@ -434,7 +434,9 @@ def matmul_batch_invariant(a, b, *, out=None):
 
 
 def linear_batch_invariant(input_, weight, bias=None):
-    output = linear_persistent(input_, weight)
+    output_shape = (*input_.shape[:-1], weight.shape[0])
+    flattened_input = input_.reshape(-1, input_.shape[-1])
+    output = linear_persistent(flattened_input, weight).reshape(output_shape)
 
     if bias is not None:
         output = output + bias

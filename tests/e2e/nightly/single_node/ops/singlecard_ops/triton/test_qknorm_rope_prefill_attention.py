@@ -2,14 +2,49 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch_npu
 
 import vllm_ascend.ops  # noqa: F401
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.ops.qwen3_qknorm_prefill_attention import (
+    SUPPORTED_MAX_SEQ_LEN,
+    _can_use_non_materializing_prefill,
+)
 
 HEAD_DIM = 128
+
+
+@pytest.mark.parametrize(
+    "seq_len,expected",
+    [(SUPPORTED_MAX_SEQ_LEN, True), (SUPPORTED_MAX_SEQ_LEN + 1, False)],
+)
+def test_prefill_dispatch_rejects_unvalidated_long_sequences(seq_len: int, expected: bool):
+    device = torch.device("npu")
+    qkv = torch.empty(seq_len, 4096, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(seq_len, dtype=torch.int64, device=device)
+    cos_sin_cache = torch.empty(256, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    metadata = SimpleNamespace(
+        actual_seq_lengths_q=[seq_len],
+        attn_state=AscendAttentionState.PrefillNoCache,
+        causal=True,
+    )
+    assert (
+        _can_use_non_materializing_prefill(
+            qkv,
+            positions,
+            cos_sin_cache,
+            metadata,
+            16,
+            8,
+            HEAD_DIM,
+            256,
+        )
+        is expected
+    )
 
 
 def reference_attention(
@@ -138,8 +173,10 @@ def test_qknorm_rope_prefill_attention_writes_paged_kv_cache():
     _, raw_k, expected_v = qkv.split((q_size, kv_size, kv_size), dim=-1)
     raw_k = raw_k.view(seq_len, num_kv_heads, HEAD_DIM).float()
     expected_k = (
-        raw_k * torch.rsqrt(raw_k.square().mean(dim=-1, keepdim=True) + 1e-6) * k_weight.float()
-    ).to(torch.bfloat16).float()
+        (raw_k * torch.rsqrt(raw_k.square().mean(dim=-1, keepdim=True) + 1e-6) * k_weight.float())
+        .to(torch.bfloat16)
+        .float()
+    )
     cos, sin = cos_sin_cache[positions].float().chunk(2, dim=-1)
     first, second = expected_k.chunk(2, dim=-1)
     expected_k = torch.cat(
@@ -177,8 +214,10 @@ def test_qknorm_rope_kv_matches_reference():
     _, raw_key, expected_value = qkv.split((q_size, kv_size, kv_size), dim=-1)
     raw_key = raw_key.view(seq_len, num_kv_heads, HEAD_DIM).float()
     expected_key = (
-        raw_key * torch.rsqrt(raw_key.square().mean(dim=-1, keepdim=True) + 1e-6) * k_weight.float()
-    ).to(torch.bfloat16).float()
+        (raw_key * torch.rsqrt(raw_key.square().mean(dim=-1, keepdim=True) + 1e-6) * k_weight.float())
+        .to(torch.bfloat16)
+        .float()
+    )
     cos, sin = cos_sin_cache[positions].float().chunk(2, dim=-1)
     first, second = expected_key.chunk(2, dim=-1)
     expected_key = torch.cat(
@@ -199,17 +238,13 @@ def test_chunked_kv_cache_then_decode_matches_full_reference(chunk_size: int):
     num_query_heads, num_kv_heads = 16, 8
     q_size = num_query_heads * HEAD_DIM
     kv_size = num_kv_heads * HEAD_DIM
-    qkv = torch.randn(
-        total_len, q_size + 2 * kv_size, dtype=torch.bfloat16, device=device
-    )
+    qkv = torch.randn(total_len, q_size + 2 * kv_size, dtype=torch.bfloat16, device=device)
     q_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device)
     k_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device)
     positions = torch.arange(total_len, dtype=torch.int64, device=device)
     angles = torch.randn(total_len, HEAD_DIM // 2, dtype=torch.float32, device=device)
     cos_sin_cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(torch.bfloat16)
-    key_cache = torch.zeros(
-        1, 128, num_kv_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
-    )
+    key_cache = torch.zeros(1, 128, num_kv_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
     value_cache = torch.zeros_like(key_cache)
     slots = torch.arange(prompt_len, dtype=torch.int32, device=device)
 
@@ -238,11 +273,9 @@ def test_chunked_kv_cache_then_decode_matches_full_reference(chunk_size: int):
         1e-6,
     )
     raw_q = qkv[-1:, :q_size].view(1, num_query_heads, HEAD_DIM).float()
-    decode_q = (
-        raw_q
-        * torch.rsqrt(raw_q.square().mean(dim=-1, keepdim=True) + 1e-6)
-        * q_weight.float()
-    ).to(torch.bfloat16)
+    decode_q = (raw_q * torch.rsqrt(raw_q.square().mean(dim=-1, keepdim=True) + 1e-6) * q_weight.float()).to(
+        torch.bfloat16
+    )
     cos, sin = cos_sin_cache[positions[-1:]].float().chunk(2, dim=-1)
     first, second = decode_q.float().chunk(2, dim=-1)
     decode_q = torch.cat(

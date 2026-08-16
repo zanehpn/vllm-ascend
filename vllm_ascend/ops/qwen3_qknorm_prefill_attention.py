@@ -10,14 +10,15 @@ import torch_npu
 from vllm.forward_context import get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend import envs
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import notify_kv_cache_written
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend import envs
 
 SUPPORTED_HEAD_DIM = 128
 SUPPORTED_QUERY_HEADS = (16, 32)
 SUPPORTED_KV_HEADS = 8
+SUPPORTED_MAX_SEQ_LEN = 128
 
 
 def _print_first_layer_component_diagnostics(
@@ -54,11 +55,14 @@ def _print_first_layer_component_diagnostics(
         x = x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
         x = (x * weight).to(torch.bfloat16).float()
         first, second = x.chunk(2, dim=-1)
-        return torch.cat(
-            (first * cos[:, None] - second * sin[:, None],
-             second * cos[:, None] + first * sin[:, None]),
-            dim=-1,
-        ).to(torch.bfloat16).float()
+        return (
+            torch.cat(
+                (first * cos[:, None] - second * sin[:, None], second * cos[:, None] + first * sin[:, None]),
+                dim=-1,
+            )
+            .to(torch.bfloat16)
+            .float()
+        )
 
     manual_q = norm_rope(raw_q, weight_q)
     manual_k = norm_rope(raw_k, weight_k)
@@ -67,16 +71,10 @@ def _print_first_layer_component_diagnostics(
 
     def error_line(name: str, actual: torch.Tensor, expected: torch.Tensor) -> str:
         error = actual.float() - expected.float()
-        return (
-            f"{name}_max={error.abs().max().item():.8f} "
-            f"{name}_mean={error.abs().mean().item():.8f}"
-        )
+        return f"{name}_max={error.abs().max().item():.8f} {name}_mean={error.abs().mean().item():.8f}"
 
     print(
-        "QKNORM_COMPONENT_ROPE "
-        + error_line("q", manual_q, backend_q)
-        + " "
-        + error_line("k", manual_k, backend_k),
+        "QKNORM_COMPONENT_ROPE " + error_line("q", manual_q, backend_q) + " " + error_line("k", manual_k, backend_k),
         flush=True,
     )
 
@@ -88,12 +86,8 @@ def _print_first_layer_component_diagnostics(
     scores = scores.masked_fill(~causal, float("-inf"))
     probability_fp32 = torch.softmax(scores, dim=-1)
     output_fp32 = torch.einsum("hts,shd->thd", probability_fp32, v)
-    output_score_bf16 = torch.einsum(
-        "hts,shd->thd", torch.softmax(scores.to(torch.bfloat16).float(), dim=-1), v
-    )
-    output_prob_bf16 = torch.einsum(
-        "hts,shd->thd", probability_fp32.to(torch.bfloat16).float(), v
-    )
+    output_score_bf16 = torch.einsum("hts,shd->thd", torch.softmax(scores.to(torch.bfloat16).float(), dim=-1), v)
+    output_prob_bf16 = torch.einsum("hts,shd->thd", probability_fp32.to(torch.bfloat16).float(), v)
     fia = baseline_output.detach().cpu().view_as(output_fp32).float()
     fused = fused_output.detach().cpu().view_as(output_fp32).float()
     print(
@@ -151,6 +145,7 @@ def _can_use_non_materializing_prefill(
         and isinstance(actual_seq_lengths_q, list)
         and len(actual_seq_lengths_q) == 1
         and actual_seq_lengths_q[0] == qkv.shape[0]
+        and qkv.shape[0] <= SUPPORTED_MAX_SEQ_LEN
         and qkv.shape[0] < max_num_batched_tokens
     )
 
@@ -173,16 +168,19 @@ def qwen3_qknorm_prefill_attention_impl(
     q_hidden_size = num_query_heads * head_dim
     kv_hidden_size = num_kv_heads * head_dim
 
-    if _can_use_non_materializing_prefill(
-        qkv,
-        positions,
-        cos_sin_cache,
-        metadata,
-        num_query_heads,
-        num_kv_heads,
-        head_dim,
-        max_num_batched_tokens,
-    ) and len(attention_layer.kv_cache) > 1:
+    if (
+        _can_use_non_materializing_prefill(
+            qkv,
+            positions,
+            cos_sin_cache,
+            metadata,
+            num_query_heads,
+            num_kv_heads,
+            head_dim,
+            max_num_batched_tokens,
+        )
+        and len(attention_layer.kv_cache) > 1
+    ):
         key_cache = attention_layer.kv_cache[0]
         value_cache = attention_layer.kv_cache[1]
         # The stock attention forward lazily binds these references during
@@ -262,10 +260,7 @@ def qwen3_qknorm_prefill_attention_impl(
             cache_slots = metadata.slot_mapping[: metadata.num_actual_tokens]
             direct_key_snapshot = None
             direct_value_snapshot = None
-            if (
-                envs.VLLM_ASCEND_QKNORM_PREFILL_DIAGNOSTIC
-                and layer_name == "model.layers.0.self_attn.attn"
-            ):
+            if envs.VLLM_ASCEND_QKNORM_PREFILL_DIAGNOSTIC and layer_name == "model.layers.0.self_attn.attn":
                 direct_key_snapshot = key_cache.view(-1, num_kv_heads, head_dim)[cache_slots].clone()
                 direct_value_snapshot = value_cache.view(-1, num_kv_heads, head_dim)[cache_slots].clone()
             fia_probe = os.getenv("VLLM_ASCEND_QKNORM_FIA_PROBE", "kv_only_tiny_fia")
