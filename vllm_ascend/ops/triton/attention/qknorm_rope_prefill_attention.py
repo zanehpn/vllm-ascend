@@ -105,17 +105,18 @@ def qknorm_rope_prefill_attention_kernel(
     STORE_CACHE: tl.constexpr,
 ):
     program_id = tl.program_id(0)
-    query_block = program_id // num_query_heads
-    query_head = program_id % num_query_heads
+    query_block = program_id // num_kv_heads
+    kv_head = program_id % num_kv_heads
     kv_group_size: tl.constexpr = num_query_heads // num_kv_heads
-    kv_head = query_head // kv_group_size
 
-    rows = query_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    query_lanes = tl.arange(0, BLOCK_M * kv_group_size)
+    rows = query_block * BLOCK_M + query_lanes % BLOCK_M
+    query_head = kv_head * kv_group_size + query_lanes // BLOCK_M
     dims = tl.arange(0, HEAD_DIM)
     half_dims = dims % HALF_HEAD_DIM
     row_mask = rows < seq_len
 
-    q_base = rows[:, None] * total_hidden_size + query_head * HEAD_DIM
+    q_base = rows[:, None] * total_hidden_size + query_head[:, None] * HEAD_DIM
     q_raw = tl.load(qkv_ptr + q_base + dims[None, :], mask=row_mask[:, None], other=0.0)
     q_fp32 = q_raw.to(tl.float32)
     q_inv_rms = 1.0 / tl.sqrt(tl.sum(q_fp32 * q_fp32, axis=1) / HEAD_DIM + eps)
@@ -159,9 +160,9 @@ def qknorm_rope_prefill_attention_kernel(
     )
     q = q_rotated.to(tl.bfloat16)
 
-    running_max = tl.full((BLOCK_M,), -float("inf"), tl.float32)
-    running_sum = tl.zeros((BLOCK_M,), tl.float32)
-    accumulator = tl.zeros((BLOCK_M, HEAD_DIM), tl.float32)
+    running_max = tl.full((BLOCK_M * kv_group_size,), -float("inf"), tl.float32)
+    running_sum = tl.zeros((BLOCK_M * kv_group_size,), tl.float32)
+    accumulator = tl.zeros((BLOCK_M * kv_group_size, HEAD_DIM), tl.float32)
 
     for key_start in tl.range(0, seq_len, BLOCK_N):
         cols = key_start + tl.arange(0, BLOCK_N)
@@ -237,14 +238,13 @@ def qknorm_rope_prefill_attention_kernel(
         if STORE_CACHE:
             # The cache layout is [num_blocks, block_size, KV heads, D].
             # A flattened slot therefore addresses one [KV heads, D] row.
-            # Only the first query block and one query head per GQA group
-            # publish this KV head, so every cache element has one writer.
+            # Only the first query block publishes this KV head, so every
+            # cache element has one writer.
             slots = tl.load(slot_mapping_ptr + cols, mask=col_mask, other=-1)
             cache_mask = (
                 col_mask[:, None]
                 & (slots[:, None] >= 0)
                 & (query_block == 0)
-                & ((query_head % kv_group_size) == 0)
             )
             cache_offset = (
                 slots[:, None] * num_kv_heads * HEAD_DIM
@@ -260,7 +260,11 @@ def qknorm_rope_prefill_attention_kernel(
         running_max = new_max
 
     output = accumulator / running_sum[:, None]
-    output_offset = rows[:, None] * num_query_heads * HEAD_DIM + query_head * HEAD_DIM + dims[None, :]
+    output_offset = (
+        rows[:, None] * num_query_heads * HEAD_DIM
+        + query_head[:, None] * HEAD_DIM
+        + dims[None, :]
+    )
     tl.store(output_ptr + output_offset, output, mask=row_mask[:, None])
 
 
@@ -299,9 +303,9 @@ def qknorm_rope_prefill_attention_impl(
         dtype=qkv.dtype,
         device=qkv.device,
     )
-    block_m = 16
+    block_m = 8 if num_query_heads // num_kv_heads == 4 else 16
     block_n = 32
-    grid = (triton.cdiv(seq_len, block_m) * num_query_heads, 1, 1)
+    grid = (triton.cdiv(seq_len, block_m) * num_kv_heads, 1, 1)
     qknorm_rope_prefill_attention_kernel[grid](
         qkv,
         q_weight,
@@ -357,9 +361,9 @@ def qknorm_rope_prefill_attention_with_cache_impl(
     output = torch.empty(
         (seq_len, num_query_heads, HEAD_DIM), dtype=qkv.dtype, device=qkv.device
     )
-    block_m = 16
+    block_m = 8 if num_query_heads // num_kv_heads == 4 else 16
     block_n = 32
-    grid = (triton.cdiv(seq_len, block_m) * num_query_heads, 1, 1)
+    grid = (triton.cdiv(seq_len, block_m) * num_kv_heads, 1, 1)
     qknorm_rope_prefill_attention_kernel[grid](
         qkv,
         q_weight,
