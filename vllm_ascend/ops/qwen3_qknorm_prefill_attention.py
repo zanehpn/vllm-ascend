@@ -184,7 +184,7 @@ def qwen3_qknorm_prefill_attention_impl(
         if attention_layer.impl.key_cache is None:
             attention_layer.impl.key_cache = key_cache
             attention_layer.impl.value_cache = value_cache
-        isolate_cache_write = os.getenv("VLLM_ASCEND_QKNORM_UNSAFE_DIRECT_CACHE") != "1"
+        isolate_cache_write = os.getenv("VLLM_ASCEND_QKNORM_SAFE_CACHE") == "1"
         if isolate_cache_write:
             fused_output = torch.ops.vllm.qknorm_rope_prefill_attention(
                 qkv,
@@ -217,6 +217,38 @@ def qwen3_qknorm_prefill_attention_impl(
             # aliasing introduced by PrivateUse1 custom-op functionalization.
             fused_output = fused_output.clone()
             notify_kv_cache_written(layer_name)
+            if os.getenv("VLLM_ASCEND_QKNORM_DIRECT_CACHE_TINY_SYNC", "1") == "1":
+                sync_key, sync_value = torch.ops.vllm.qknorm_rope_kv(
+                    qkv[:1],
+                    k_weight,
+                    cos_sin_cache,
+                    positions[:1],
+                    num_query_heads,
+                    num_kv_heads,
+                    eps,
+                )
+                DeviceOperator.reshape_and_cache(
+                    sync_key,
+                    sync_value,
+                    key_cache,
+                    value_cache,
+                    metadata.slot_mapping[:1],
+                )
+                tiny_q = torch.zeros((1, num_query_heads, head_dim), dtype=qkv.dtype, device=qkv.device)
+                tiny_kv = torch.zeros((1, num_kv_heads, head_dim), dtype=qkv.dtype, device=qkv.device)
+                torch_npu.npu_fused_infer_attention_score(
+                    query=tiny_q,
+                    key=tiny_kv,
+                    value=tiny_kv,
+                    input_layout="TND",
+                    actual_seq_lengths=[1],
+                    actual_seq_lengths_kv=[1],
+                    num_key_value_heads=num_kv_heads,
+                    num_heads=num_query_heads,
+                    scale=scale,
+                    sparse_mode=0,
+                )
+                return fused_output.view(qkv.shape[0], q_hidden_size)
         if envs.VLLM_ASCEND_QKNORM_PREFILL_DIAGNOSTIC or isolate_cache_write:
             fused_snapshot = fused_output.clone()
             torch.npu.synchronize()
