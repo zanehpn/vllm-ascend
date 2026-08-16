@@ -126,8 +126,12 @@ def _can_use_non_materializing_prefill(
     num_query_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    max_num_batched_tokens: int,
 ) -> bool:
     actual_seq_lengths_q = getattr(metadata, "actual_seq_lengths_q", None)
+    # A first full-sized chunk is reported as PrefillNoCache even when more
+    # prompt chunks remain. This kernel currently handles a complete sequence,
+    # so keep a full scheduler chunk on the established paged FIA path.
     return (
         metadata is not None
         and metadata.attn_state == AscendAttentionState.PrefillNoCache
@@ -147,6 +151,7 @@ def _can_use_non_materializing_prefill(
         and isinstance(actual_seq_lengths_q, list)
         and len(actual_seq_lengths_q) == 1
         and actual_seq_lengths_q[0] == qkv.shape[0]
+        and qkv.shape[0] < max_num_batched_tokens
     )
 
 
@@ -160,6 +165,7 @@ def qwen3_qknorm_prefill_attention_impl(
     num_query_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    max_num_batched_tokens: int,
     eps: float,
     scale: float,
 ) -> torch.Tensor:
@@ -175,6 +181,7 @@ def qwen3_qknorm_prefill_attention_impl(
         num_query_heads,
         num_kv_heads,
         head_dim,
+        max_num_batched_tokens,
     ) and len(attention_layer.kv_cache) > 1:
         key_cache = attention_layer.kv_cache[0]
         value_cache = attention_layer.kv_cache[1]
@@ -454,11 +461,12 @@ def qwen3_qknorm_prefill_attention_fake(
     num_query_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    max_num_batched_tokens: int,
     eps: float,
     scale: float,
 ) -> torch.Tensor:
     del q_weight, k_weight, cos_sin_cache, positions, layer_name
-    del num_kv_heads, eps, scale
+    del num_kv_heads, max_num_batched_tokens, eps, scale
     return torch.empty(
         (qkv.shape[0], num_query_heads * head_dim),
         dtype=qkv.dtype,

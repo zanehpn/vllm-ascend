@@ -71,6 +71,7 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
+                self.attn.impl.vllm_config.scheduler_config.max_num_batched_tokens,
                 self.q_norm.variance_epsilon,
                 self.scaling,
             )
