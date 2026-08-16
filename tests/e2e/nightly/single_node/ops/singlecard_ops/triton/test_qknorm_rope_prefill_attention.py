@@ -10,30 +10,38 @@ import torch_npu
 
 import vllm_ascend.ops  # noqa: F401
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.qwen3_qknorm_prefill_attention import (
-    SUPPORTED_MAX_SEQ_LEN,
-    _can_use_non_materializing_prefill,
+    _can_use_fused_preprocess_fia,
 )
 
 HEAD_DIM = 128
 
 
 @pytest.mark.parametrize(
-    "seq_len,expected",
-    [(SUPPORTED_MAX_SEQ_LEN, True), (SUPPORTED_MAX_SEQ_LEN + 1, False)],
+    "attn_state,expected",
+    [
+        (AscendAttentionState.PrefillNoCache, True),
+        (AscendAttentionState.PrefillCacheHit, False),
+        (AscendAttentionState.ChunkedPrefill, False),
+        (AscendAttentionState.DecodeOnly, False),
+    ],
 )
-def test_prefill_dispatch_rejects_unvalidated_long_sequences(seq_len: int, expected: bool):
+def test_fused_preprocess_dispatch_states(attn_state: AscendAttentionState, expected: bool):
     device = torch.device("npu")
+    seq_len = 128
     qkv = torch.empty(seq_len, 4096, dtype=torch.bfloat16, device=device)
     positions = torch.arange(seq_len, dtype=torch.int64, device=device)
     cos_sin_cache = torch.empty(256, HEAD_DIM, dtype=torch.bfloat16, device=device)
     metadata = SimpleNamespace(
         actual_seq_lengths_q=[seq_len],
-        attn_state=AscendAttentionState.PrefillNoCache,
+        attn_state=attn_state,
         causal=True,
+        slot_mapping=torch.arange(seq_len, dtype=torch.int32, device=device),
+        block_tables=torch.zeros((1, 2), dtype=torch.int32, device=device),
     )
     assert (
-        _can_use_non_materializing_prefill(
+        _can_use_fused_preprocess_fia(
             qkv,
             positions,
             cos_sin_cache,
@@ -44,6 +52,142 @@ def test_prefill_dispatch_rejects_unvalidated_long_sequences(seq_len: int, expec
             256,
         )
         is expected
+    )
+
+
+@pytest.mark.parametrize("seq_len,expected", [(128, True), (129, False), (256, False)])
+def test_fused_preprocess_dispatch_lengths(seq_len: int, expected: bool):
+    device = torch.device("npu")
+    qkv = torch.empty(seq_len, 4096, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(seq_len, dtype=torch.int64, device=device)
+    cos_sin_cache = torch.empty(256, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    metadata = SimpleNamespace(
+        actual_seq_lengths_q=[seq_len],
+        attn_state=AscendAttentionState.PrefillNoCache,
+        causal=True,
+        slot_mapping=torch.arange(seq_len, dtype=torch.int32, device=device),
+        block_tables=torch.zeros((1, 2), dtype=torch.int32, device=device),
+    )
+    assert (
+        _can_use_fused_preprocess_fia(
+            qkv,
+            positions,
+            cos_sin_cache,
+            metadata,
+            16,
+            8,
+            HEAD_DIM,
+            256,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize("num_query_heads", [16, 32])
+def test_qkv_rmsnorm_rope_cache_matches_materialized_reference(num_query_heads: int):
+    torch.manual_seed(5)
+    device = torch.device("npu")
+    seq_len, num_kv_heads = 17, 8
+    q_size = num_query_heads * HEAD_DIM
+    kv_size = num_kv_heads * HEAD_DIM
+    qkv = torch.randn(seq_len, q_size + 2 * kv_size, dtype=torch.bfloat16, device=device)
+    q_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device)
+    k_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(seq_len, dtype=torch.int64, device=device)
+    angles = torch.randn(seq_len, HEAD_DIM // 2, dtype=torch.float32, device=device)
+    cos_sin_cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(torch.bfloat16)
+    slot_mapping = torch.randperm(seq_len, dtype=torch.int32, device=device)
+    key_cache = torch.zeros(2, 128, num_kv_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    value_cache = torch.zeros_like(key_cache)
+
+    query = torch.ops.vllm.qkv_rmsnorm_rope_cache(
+        qkv,
+        cos_sin_cache,
+        positions,
+        q_weight,
+        k_weight,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        q_size,
+        kv_size,
+        HEAD_DIM,
+        1e-6,
+        False,
+    )
+    expected_query, expected_key, expected_value = DeviceOperator.split_qkv_rmsnorm_rope(
+        input=qkv,
+        q_weight=q_weight,
+        k_weight=k_weight,
+        q_hidden_size=q_size,
+        kv_hidden_size=kv_size,
+        head_dim=HEAD_DIM,
+        eps=1e-6,
+        q_bias=None,
+        k_bias=None,
+        cos_sin_cache=cos_sin_cache,
+        positions=positions,
+    )
+    flat_key = key_cache.view(-1, num_kv_heads, HEAD_DIM)
+    flat_value = value_cache.view(-1, num_kv_heads, HEAD_DIM)
+    torch.testing.assert_close(query.view_as(expected_query), expected_query, rtol=0, atol=0)
+    torch.testing.assert_close(flat_key[slot_mapping.long()], expected_key.view_as(flat_key[:seq_len]), rtol=0, atol=0)
+    torch.testing.assert_close(
+        flat_value[slot_mapping.long()], expected_value.view_as(flat_value[:seq_len]), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("num_query_heads", [16, 32])
+def test_qkv_rmsnorm_rope_contiguous_cache_matches_materialized_reference(num_query_heads: int):
+    torch.manual_seed(7)
+    device = torch.device("npu")
+    seq_len, num_kv_heads, first_slot = 17, 8, 128
+    q_size = num_query_heads * HEAD_DIM
+    kv_size = num_kv_heads * HEAD_DIM
+    qkv = torch.randn(seq_len, q_size + 2 * kv_size, dtype=torch.bfloat16, device=device)
+    q_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device)
+    k_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(seq_len, dtype=torch.int64, device=device)
+    angles = torch.randn(seq_len, HEAD_DIM // 2, dtype=torch.float32, device=device)
+    cos_sin_cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(torch.bfloat16)
+    slot_mapping = torch.arange(first_slot, first_slot + seq_len, dtype=torch.int32, device=device)
+    key_cache = torch.zeros(2, 128, num_kv_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    value_cache = torch.zeros_like(key_cache)
+
+    query = torch.ops.vllm.qkv_rmsnorm_rope_cache(
+        qkv,
+        cos_sin_cache,
+        positions,
+        q_weight,
+        k_weight,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        q_size,
+        kv_size,
+        HEAD_DIM,
+        1e-6,
+        True,
+    )
+    expected_query, expected_key, expected_value = DeviceOperator.split_qkv_rmsnorm_rope(
+        input=qkv,
+        q_weight=q_weight,
+        k_weight=k_weight,
+        q_hidden_size=q_size,
+        kv_hidden_size=kv_size,
+        head_dim=HEAD_DIM,
+        eps=1e-6,
+        q_bias=None,
+        k_bias=None,
+        cos_sin_cache=cos_sin_cache,
+        positions=positions,
+    )
+    flat_key = key_cache.view(-1, num_kv_heads, HEAD_DIM)
+    flat_value = value_cache.view(-1, num_kv_heads, HEAD_DIM)
+    torch.testing.assert_close(query.view_as(expected_query), expected_query, rtol=0, atol=0)
+    torch.testing.assert_close(flat_key[slot_mapping.long()], expected_key.view_as(flat_key[:seq_len]), rtol=0, atol=0)
+    torch.testing.assert_close(
+        flat_value[slot_mapping.long()], expected_value.view_as(flat_value[:seq_len]), rtol=0, atol=0
     )
 
 

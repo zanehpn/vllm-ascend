@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Compare materialized QK-Norm/RoPE + FIA with the fused prototype."""
+"""Compare the production QK-Norm/RoPE + FIA path with fused preprocessing + FIA."""
 
 import argparse
 import math
@@ -11,6 +11,9 @@ import torch_npu
 
 import vllm_ascend.ops  # noqa: F401
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.ops.triton.linearnorm.split_qkv_rmsnorm_rope import (
+    qkv_rmsnorm_rope_cache_impl,
+)
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 
 HEAD_DIM = 128
@@ -52,6 +55,11 @@ def main() -> None:
         action="store_true",
         help="Skip attention and compare only K/V cache publication paths.",
     )
+    parser.add_argument(
+        "--production-only",
+        action="store_true",
+        help="Compare only the production FIA path and fused-preprocess FIA path.",
+    )
     args = parser.parse_args()
 
     torch.npu.set_device(args.device)
@@ -81,9 +89,8 @@ def main() -> None:
     )
     key_cache = torch.empty(cache_shape, dtype=qkv.dtype, device=args.device)
     value_cache = torch.empty_like(key_cache)
-    slot_mapping = torch.arange(
-        args.seq_len, dtype=torch.int64, device=args.device
-    )
+    slot_mapping = torch.arange(args.seq_len, dtype=torch.int32, device=args.device)
+    block_table = torch.arange(num_cache_blocks, dtype=torch.int32, device=args.device).view(1, -1)
     causal_mask = torch.ones(
         FIA_CAUSAL_MASK_SIZE,
         FIA_CAUSAL_MASK_SIZE,
@@ -105,12 +112,139 @@ def main() -> None:
             cos_sin_cache=cos_sin_cache,
             positions=positions,
         )
+        DeviceOperator.reshape_and_cache(
+            k.view(args.seq_len, num_kv_heads, HEAD_DIM),
+            v.view(args.seq_len, num_kv_heads, HEAD_DIM),
+            key_cache,
+            value_cache,
+            slot_mapping,
+        )
         return torch_npu.npu_fused_infer_attention_score(
             query=q.view(args.seq_len, num_query_heads, HEAD_DIM),
             key=k.view(args.seq_len, num_kv_heads, HEAD_DIM),
             value=v.view(args.seq_len, num_kv_heads, HEAD_DIM),
             atten_mask=causal_mask,
             input_layout="TND",
+            actual_seq_lengths=[args.seq_len],
+            actual_seq_lengths_kv=[args.seq_len],
+            num_heads=num_query_heads,
+            num_key_value_heads=num_kv_heads,
+            sparse_mode=3,
+            scale=scale,
+        )[0]
+
+    def fused_preprocess_fia():
+        query = qkv_rmsnorm_rope_cache_impl(
+            qkv,
+            cos_sin_cache,
+            positions,
+            q_weight,
+            k_weight,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            q_size,
+            kv_size,
+            HEAD_DIM,
+            1e-6,
+            True,
+        ).view(args.seq_len, num_query_heads, HEAD_DIM)
+        return torch_npu.npu_fused_infer_attention_score(
+            query=query,
+            key=key_cache.view(num_cache_blocks, CACHE_BLOCK_SIZE, -1),
+            value=value_cache.view(num_cache_blocks, CACHE_BLOCK_SIZE, -1),
+            atten_mask=causal_mask,
+            block_table=block_table,
+            input_layout="TND",
+            block_size=CACHE_BLOCK_SIZE,
+            actual_seq_lengths=[args.seq_len],
+            actual_seq_lengths_kv=[args.seq_len],
+            num_heads=num_query_heads,
+            num_key_value_heads=num_kv_heads,
+            sparse_mode=3,
+            scale=scale,
+        )[0]
+
+    def fused_preprocess_only():
+        return qkv_rmsnorm_rope_cache_impl(
+            qkv,
+            cos_sin_cache,
+            positions,
+            q_weight,
+            k_weight,
+            key_cache,
+            value_cache,
+            slot_mapping,
+            q_size,
+            kv_size,
+            HEAD_DIM,
+            1e-6,
+            True,
+        ).view(args.seq_len, num_query_heads, HEAD_DIM)
+
+    reference_query, reference_key, reference_value = DeviceOperator.split_qkv_rmsnorm_rope(
+        input=qkv,
+        q_weight=q_weight,
+        k_weight=k_weight,
+        q_hidden_size=q_size,
+        kv_hidden_size=kv_size,
+        head_dim=HEAD_DIM,
+        eps=1e-6,
+        q_bias=None,
+        k_bias=None,
+        cos_sin_cache=cos_sin_cache,
+        positions=positions,
+    )
+    fused_query = fused_preprocess_only()
+
+    def materialize_only():
+        return DeviceOperator.split_qkv_rmsnorm_rope(
+            input=qkv,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            q_hidden_size=q_size,
+            kv_hidden_size=kv_size,
+            head_dim=HEAD_DIM,
+            eps=1e-6,
+            q_bias=None,
+            k_bias=None,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
+        )
+
+    def scatter_only():
+        return DeviceOperator.reshape_and_cache(
+            reference_key.view(args.seq_len, num_kv_heads, HEAD_DIM),
+            reference_value.view(args.seq_len, num_kv_heads, HEAD_DIM),
+            key_cache,
+            value_cache,
+            slot_mapping,
+        )
+
+    def contiguous_fia_only():
+        return torch_npu.npu_fused_infer_attention_score(
+            query=reference_query.view(args.seq_len, num_query_heads, HEAD_DIM),
+            key=reference_key.view(args.seq_len, num_kv_heads, HEAD_DIM),
+            value=reference_value.view(args.seq_len, num_kv_heads, HEAD_DIM),
+            atten_mask=causal_mask,
+            input_layout="TND",
+            actual_seq_lengths=[args.seq_len],
+            actual_seq_lengths_kv=[args.seq_len],
+            num_heads=num_query_heads,
+            num_key_value_heads=num_kv_heads,
+            sparse_mode=3,
+            scale=scale,
+        )[0]
+
+    def paged_fia_only():
+        return torch_npu.npu_fused_infer_attention_score(
+            query=fused_query,
+            key=key_cache.view(num_cache_blocks, CACHE_BLOCK_SIZE, -1),
+            value=value_cache.view(num_cache_blocks, CACHE_BLOCK_SIZE, -1),
+            atten_mask=causal_mask,
+            block_table=block_table,
+            input_layout="TND",
+            block_size=CACHE_BLOCK_SIZE,
             actual_seq_lengths=[args.seq_len],
             actual_seq_lengths_kv=[args.seq_len],
             num_heads=num_query_heads,
@@ -197,43 +331,30 @@ def main() -> None:
             )
 
     if args.cache_only:
-        kv_then_official_cache_ms = timed_ms(
-            kv_then_official_cache, args.warmup, args.repeats
-        )
-        direct_cache_ms = timed_ms(
-            kv_cache_only, args.warmup, args.repeats
-        )
+        kv_then_official_cache_ms = timed_ms(kv_then_official_cache, args.warmup, args.repeats)
+        direct_cache_ms = timed_ms(kv_cache_only, args.warmup, args.repeats)
         payload_bytes = 2 * args.seq_len * kv_size * qkv.element_size()
         print(f"model={args.model} seq_len={args.seq_len}")
-        print(
-            "K/V-only + official cache write: "
-            f"{kv_then_official_cache_ms:.3f} ms"
-        )
+        print(f"K/V-only + official cache write: {kv_then_official_cache_ms:.3f} ms")
         print(f"K/V-only direct paged-cache write: {direct_cache_ms:.3f} ms")
-        print(
-            "direct-vs-official speedup: "
-            f"{kv_then_official_cache_ms / direct_cache_ms:.3f}x"
-        )
-        print(
-            "direct cache payload bandwidth: "
-            f"{payload_bytes / (direct_cache_ms / 1000) / 1e9:.2f} GB/s"
-        )
+        print(f"direct-vs-official speedup: {kv_then_official_cache_ms / direct_cache_ms:.3f}x")
+        print(f"direct cache payload bandwidth: {payload_bytes / (direct_cache_ms / 1000) / 1e9:.2f} GB/s")
         if args.chunk_size:
-            chunked_ms = timed_ms(
-                chunked_kv_cache_only, args.warmup, args.repeats
-            )
+            chunked_ms = timed_ms(chunked_kv_cache_only, args.warmup, args.repeats)
             print(f"chunk_size={args.chunk_size}")
             print(f"chunked K/V-only cache write: {chunked_ms:.3f} ms")
         return
 
     baseline_output = baseline()
-    fused_output = fused()
-    fused_cached_output = fused_cached()
+    fused_preprocess_fia_output = fused_preprocess_fia()
     torch.npu.synchronize()
-    torch.testing.assert_close(fused_output, baseline_output, rtol=2e-2, atol=2e-2)
-    torch.testing.assert_close(
-        fused_cached_output, baseline_output, rtol=2e-2, atol=2e-2
-    )
+    torch.testing.assert_close(fused_preprocess_fia_output, baseline_output, rtol=2e-2, atol=2e-2)
+    if not args.production_only:
+        fused_output = fused()
+        fused_cached_output = fused_cached()
+        torch.npu.synchronize()
+        torch.testing.assert_close(fused_output, baseline_output, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(fused_cached_output, baseline_output, rtol=2e-2, atol=2e-2)
 
     _, expected_key, expected_value = DeviceOperator.split_qkv_rmsnorm_rope(
         input=qkv,
@@ -262,52 +383,44 @@ def main() -> None:
     )
 
     baseline_ms = timed_ms(baseline, args.warmup, args.repeats)
-    fused_ms = timed_ms(fused, args.warmup, args.repeats)
-    fused_cached_ms = timed_ms(fused_cached, args.warmup, args.repeats)
-    kv_cache_ms = timed_ms(kv_cache_only, args.warmup, args.repeats)
-    qk_bytes = args.seq_len * (q_size + kv_size) * qkv.element_size()
-    block_m = 8 if num_query_heads // num_kv_heads == 4 else 16
-    query_blocks = math.ceil(args.seq_len / block_m)
-    # The old fused kernel rereads raw K twice (RMS reduction plus gamma/RoPE)
-    # for every query block. The cached path reads it twice only once.
-    avoided_k_read_bytes = (
-        2
-        * (query_blocks - 1)
-        * args.seq_len
-        * kv_size
-        * qkv.element_size()
-    )
-    cache_payload_bytes = 2 * args.seq_len * kv_size * qkv.element_size()
+    fused_preprocess_fia_ms = timed_ms(fused_preprocess_fia, args.warmup, args.repeats)
+    fused_preprocess_only_ms = timed_ms(fused_preprocess_only, args.warmup, args.repeats)
+    materialize_only_ms = timed_ms(materialize_only, args.warmup, args.repeats)
+    scatter_only_ms = timed_ms(scatter_only, args.warmup, args.repeats)
+    contiguous_fia_only_ms = timed_ms(contiguous_fia_only, args.warmup, args.repeats)
+    paged_fia_only_ms = timed_ms(paged_fia_only, args.warmup, args.repeats)
     print(f"model={args.model} seq_len={args.seq_len}")
-    print(f"materialized baseline: {baseline_ms:.3f} ms")
-    print(f"non-materializing fused: {fused_ms:.3f} ms")
-    print(f"K-once paged-cache fused: {fused_cached_ms:.3f} ms")
-    print(f"K/V-only direct paged-cache write: {kv_cache_ms:.3f} ms")
-    print(f"speedup: {baseline_ms / fused_ms:.3f}x")
-    print(f"K-once speedup vs recompute: {fused_ms / fused_cached_ms:.3f}x")
-    print(
-        "modeled K reread traffic eliminated: "
-        f"{avoided_k_read_bytes / 1024**3:.3f} GiB"
-    )
-    print(
-        "modeled avoided-K bandwidth: "
-        f"{avoided_k_read_bytes / (fused_cached_ms / 1000) / 1e9:.2f} GB/s"
-    )
-    print(
-        "direct cache payload bandwidth: "
-        f"{cache_payload_bytes / (kv_cache_ms / 1000) / 1e9:.2f} GB/s"
-    )
-    if args.chunk_size:
-        chunked_ms = timed_ms(
-            chunked_kv_cache_only, args.warmup, args.repeats
-        )
-        print(f"chunk_size={args.chunk_size}")
-        print(f"chunked K/V-only cache write: {chunked_ms:.3f} ms")
-        print(
-            "chunked cache payload bandwidth: "
-            f"{cache_payload_bytes / (chunked_ms / 1000) / 1e9:.2f} GB/s"
-        )
-    print(f"eliminated full-QK HBM traffic: {2 * qk_bytes / 1024**2:.2f} MiB (one write + one read)")
+    print(f"production materialized + cache write + FIA: {baseline_ms:.3f} ms")
+    print(f"fused Q/K + direct cache write + FIA: {fused_preprocess_fia_ms:.3f} ms")
+    print(f"production-path speedup: {baseline_ms / fused_preprocess_fia_ms:.3f}x")
+    print(f"fused preprocess only: {fused_preprocess_only_ms:.3f} ms")
+    print(f"materialized Q/K/V only: {materialize_only_ms:.3f} ms")
+    print(f"official cache scatter only: {scatter_only_ms:.3f} ms")
+    print(f"contiguous FIA only: {contiguous_fia_only_ms:.3f} ms")
+    print(f"paged FIA only: {paged_fia_only_ms:.3f} ms")
+    if not args.production_only:
+        fused_ms = timed_ms(fused, args.warmup, args.repeats)
+        fused_cached_ms = timed_ms(fused_cached, args.warmup, args.repeats)
+        kv_cache_ms = timed_ms(kv_cache_only, args.warmup, args.repeats)
+        qk_bytes = args.seq_len * (q_size + kv_size) * qkv.element_size()
+        block_m = 8 if num_query_heads // num_kv_heads == 4 else 16
+        query_blocks = math.ceil(args.seq_len / block_m)
+        avoided_k_read_bytes = 2 * (query_blocks - 1) * args.seq_len * kv_size * qkv.element_size()
+        cache_payload_bytes = 2 * args.seq_len * kv_size * qkv.element_size()
+        print(f"non-materializing fused: {fused_ms:.3f} ms")
+        print(f"K-once paged-cache fused: {fused_cached_ms:.3f} ms")
+        print(f"K/V-only direct paged-cache write: {kv_cache_ms:.3f} ms")
+        print(f"speedup: {baseline_ms / fused_ms:.3f}x")
+        print(f"K-once speedup vs recompute: {fused_ms / fused_cached_ms:.3f}x")
+        print(f"modeled K reread traffic eliminated: {avoided_k_read_bytes / 1024**3:.3f} GiB")
+        print(f"modeled avoided-K bandwidth: {avoided_k_read_bytes / (fused_cached_ms / 1000) / 1e9:.2f} GB/s")
+        print(f"direct cache payload bandwidth: {cache_payload_bytes / (kv_cache_ms / 1000) / 1e9:.2f} GB/s")
+        if args.chunk_size:
+            chunked_ms = timed_ms(chunked_kv_cache_only, args.warmup, args.repeats)
+            print(f"chunk_size={args.chunk_size}")
+            print(f"chunked K/V-only cache write: {chunked_ms:.3f} ms")
+            print(f"chunked cache payload bandwidth: {cache_payload_bytes / (chunked_ms / 1000) / 1e9:.2f} GB/s")
+        print(f"eliminated full-QK HBM traffic: {2 * qk_bytes / 1024**2:.2f} MiB (one write + one read)")
 
 
 if __name__ == "__main__":

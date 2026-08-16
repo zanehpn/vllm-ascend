@@ -51,6 +51,9 @@ def split_qkv_rmsnorm_rope_kernel(
     v_batch_size_per_iter_per_vec: tl.constexpr,
     positions_gm_ptr,
     cos_sin_cache_gm_ptr,
+    slot_mapping_gm_ptr,
+    CACHE_MODE: tl.constexpr,
+    CONTIGUOUS_CACHE: tl.constexpr,
 ):
     row_pid = tl.program_id(0)
 
@@ -222,7 +225,20 @@ def split_qkv_rmsnorm_rope_kernel(
             strides=(1, 1, 1),
         )
 
-        kv_output_idx = output_kv_nblk_idx[None, :] + (mblk_idx + pos_offset)[:, None] * kv_hidden_size
+        if CACHE_MODE:
+            if CONTIGUOUS_CACHE:
+                first_slot = tl.load(slot_mapping_gm_ptr)
+                slots = first_slot + mblk_idx + pos_offset
+            else:
+                slots = tl.load(
+                    slot_mapping_gm_ptr + mblk_idx + pos_offset,
+                    mask=mmask,
+                    other=-1,
+                )
+            kv_output_idx = output_kv_nblk_idx[None, :] + slots[:, None] * kv_hidden_size
+            mmask = mmask & (slots >= 0)
+        else:
+            kv_output_idx = output_kv_nblk_idx[None, :] + (mblk_idx + pos_offset)[:, None] * kv_hidden_size
         mask = (mmask[:, None]) & (output_kv_nmask[None, :])
         if IS_PARTIAL_ROPE:
             normalized_values_tmp1 = insert_slice(
@@ -255,7 +271,16 @@ def split_qkv_rmsnorm_rope_kernel(
         mask = (mmask[:, None]) & (nmask[None, :])
         idx = mblk_idx[:, None] * total_hidden_size + nblk_idx[None, :]
         values = tl.load(input_gm_ptr + idx, mask=mask)
-        out_idx = mblk_idx[:, None] * kv_hidden_size + out_nblk_idx[None, :]
+        if CACHE_MODE:
+            if CONTIGUOUS_CACHE:
+                first_slot = tl.load(slot_mapping_gm_ptr)
+                slots = first_slot + mblk_idx
+            else:
+                slots = tl.load(slot_mapping_gm_ptr + mblk_idx, mask=mmask, other=-1)
+            out_idx = slots[:, None] * kv_hidden_size + out_nblk_idx[None, :]
+            mmask = mmask & (slots >= 0)
+        else:
+            out_idx = mblk_idx[:, None] * kv_hidden_size + out_nblk_idx[None, :]
         out_mask = (mmask[:, None]) & (out_nmask[None, :])
         tl.store(v_gm_ptr + out_idx, values, mask=out_mask)
         mblk_idx += v_batch_size_per_iter_per_vec
@@ -340,8 +365,131 @@ def split_qkv_rmsnorm_rope_impl(
         int(v_batch_size_per_iter_per_vec),
         positions,
         cos_sin_cache,
+        positions,
+        CACHE_MODE=False,
+        CONTIGUOUS_CACHE=False,
     )
     return q_output, k_output, v_output
+
+
+def qkv_rmsnorm_rope_cache_impl(
+    input: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    q_hidden_size: int,
+    kv_hidden_size: int,
+    head_dim: int,
+    eps: float,
+    contiguous_cache: bool,
+) -> torch.Tensor:
+    """Return Q while normalized/rotated K and raw V go to paged cache."""
+    if input.dtype != torch.bfloat16 or input.ndim != 2:
+        raise ValueError("input must be a 2D bfloat16 tensor")
+    if input.shape[1] != q_hidden_size + 2 * kv_hidden_size:
+        raise ValueError("input hidden size does not match Q/K/V hidden sizes")
+    if q_hidden_size % head_dim or kv_hidden_size % head_dim:
+        raise ValueError("Q and K/V hidden sizes must be divisible by head_dim")
+    if q_weight.numel() != head_dim or k_weight.numel() != head_dim:
+        raise ValueError("Q/K RMSNorm weights must each contain head_dim elements")
+    if q_weight.device != input.device or k_weight.device != input.device:
+        raise ValueError("input and Q/K RMSNorm weights must be on the same device")
+    if cos_sin_cache.device != input.device or positions.device != input.device:
+        raise ValueError("input, positions, and cos_sin_cache must be on the same device")
+    if cos_sin_cache.ndim != 2 or positions.ndim != 1 or positions.shape[0] != input.shape[0]:
+        raise ValueError("positions and cos_sin_cache have incompatible shapes")
+    if key_cache.dtype != input.dtype or value_cache.dtype != input.dtype:
+        raise ValueError("input and KV cache must have the same dtype")
+    if key_cache.device != input.device or value_cache.device != input.device:
+        raise ValueError("input and KV cache must be on the same device")
+    if key_cache.numel() != value_cache.numel():
+        raise ValueError("key and value caches must have equal size")
+    if slot_mapping.ndim != 1 or slot_mapping.shape[0] < input.shape[0]:
+        raise ValueError("slot_mapping must contain one slot per token")
+    if head_dim != 128:
+        raise ValueError(f"only head_dim=128 is supported, got {head_dim}")
+
+    num_vectorcore = get_vectorcore_num()
+    rope_dim = cos_sin_cache.shape[-1]
+    batch_size = input.shape[0]
+    total_hidden_size = q_hidden_size + kv_hidden_size * 2
+    q_head_num = q_hidden_size // head_dim
+    kv_head_num = kv_hidden_size // head_dim
+    is_partial_rope = rope_dim != head_dim
+    q_output = torch.empty(batch_size, q_hidden_size, device=input.device, dtype=input.dtype)
+
+    ub_size = 87040
+    if is_partial_rope:
+        factor = 5 * q_hidden_size + 3 * kv_hidden_size + rope_dim * 4 + q_head_num * rope_dim
+        batch_size_per_iter_per_vec = int(ub_size / input.element_size()) // factor
+    else:
+        factor = 5 * q_hidden_size + 3 * kv_hidden_size + rope_dim * 2 + q_head_num * rope_dim // 2
+        batch_size_per_iter_per_vec = int(ub_size / input.element_size()) // factor
+    batch_size_per_iter_per_vec = max(1, batch_size_per_iter_per_vec)
+    qk_head_num_sum = q_head_num + kv_head_num
+    qk_head_nums_per_iter_per_vec = batch_size_per_iter_per_vec * qk_head_num_sum
+    max_v_batch_size_per_iter = ub_size / torch.bfloat16.itemsize // (kv_hidden_size + 1)
+    batch_size_per_vec = triton.cdiv(batch_size, num_vectorcore)
+    v_batch_size_per_iter_per_vec = min(max_v_batch_size_per_iter, batch_size_per_vec)
+
+    grid = (num_vectorcore, 1, 1)
+    split_qkv_rmsnorm_rope_kernel[grid](
+        input,
+        q_output,
+        key_cache,
+        value_cache,
+        q_weight,
+        q_weight,
+        k_weight,
+        k_weight,
+        batch_size,
+        q_hidden_size,
+        kv_hidden_size,
+        total_hidden_size,
+        eps,
+        False,
+        head_dim,
+        rope_dim,
+        rope_dim // 2,
+        is_partial_rope,
+        num_vectorcore,
+        int(batch_size_per_iter_per_vec),
+        int(qk_head_nums_per_iter_per_vec),
+        q_head_num,
+        kv_head_num,
+        qk_head_num_sum,
+        int(v_batch_size_per_iter_per_vec),
+        positions,
+        cos_sin_cache,
+        slot_mapping,
+        CACHE_MODE=True,
+        CONTIGUOUS_CACHE=contiguous_cache,
+    )
+    return q_output
+
+
+def qkv_rmsnorm_rope_cache_fake(
+    input: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    q_hidden_size: int,
+    kv_hidden_size: int,
+    head_dim: int,
+    eps: float,
+    contiguous_cache: bool,
+) -> torch.Tensor:
+    del cos_sin_cache, positions, q_weight, k_weight, key_cache, value_cache
+    del slot_mapping, kv_hidden_size, head_dim, eps, contiguous_cache
+    return torch.empty(input.shape[0], int(q_hidden_size), device=input.device, dtype=input.dtype)
 
 
 def split_qkv_rmsnorm_rope_impl_fake(
@@ -380,6 +528,14 @@ def split_qkv_rmsnorm_rope_impl_fake(
     )
     return q_output, k_output, v_output
 
+
+direct_register_custom_op(
+    op_name="qkv_rmsnorm_rope_cache",
+    op_func=qkv_rmsnorm_rope_cache_impl,
+    fake_impl=qkv_rmsnorm_rope_cache_fake,
+    mutates_args=["key_cache", "value_cache"],
+    dispatch_key="PrivateUse1",
+)
 
 direct_register_custom_op(
     op_name="qkv_rmsnorm_rope",
