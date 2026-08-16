@@ -10,14 +10,15 @@ import torch_npu
 from vllm.forward_context import get_forward_context
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend import envs
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import notify_kv_cache_written
 from vllm_ascend.device.device_op import DeviceOperator
-from vllm_ascend import envs
 
 SUPPORTED_HEAD_DIM = 128
 SUPPORTED_QUERY_HEADS = (16, 32)
 SUPPORTED_KV_HEADS = 8
+SUPPORTED_MAX_SEQ_LEN = 128
 
 
 def _print_first_layer_component_diagnostics(
@@ -151,6 +152,7 @@ def _can_use_non_materializing_prefill(
         and isinstance(actual_seq_lengths_q, list)
         and len(actual_seq_lengths_q) == 1
         and actual_seq_lengths_q[0] == qkv.shape[0]
+        and qkv.shape[0] <= SUPPORTED_MAX_SEQ_LEN
         and qkv.shape[0] < max_num_batched_tokens
     )
 

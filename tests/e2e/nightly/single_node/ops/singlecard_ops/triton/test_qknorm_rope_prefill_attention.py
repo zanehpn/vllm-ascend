@@ -2,14 +2,51 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch_npu
 
 import vllm_ascend.ops  # noqa: F401
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.ops.qwen3_qknorm_prefill_attention import (
+    SUPPORTED_MAX_SEQ_LEN,
+    _can_use_non_materializing_prefill,
+)
 
 HEAD_DIM = 128
+
+
+@pytest.mark.parametrize(
+    "seq_len,expected",
+    [(SUPPORTED_MAX_SEQ_LEN, True), (SUPPORTED_MAX_SEQ_LEN + 1, False)],
+)
+def test_prefill_dispatch_rejects_unvalidated_long_sequences(
+    seq_len: int, expected: bool
+):
+    device = torch.device("npu")
+    qkv = torch.empty(seq_len, 4096, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(seq_len, dtype=torch.int64, device=device)
+    cos_sin_cache = torch.empty(256, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    metadata = SimpleNamespace(
+        actual_seq_lengths_q=[seq_len],
+        attn_state=AscendAttentionState.PrefillNoCache,
+        causal=True,
+    )
+    assert (
+        _can_use_non_materializing_prefill(
+            qkv,
+            positions,
+            cos_sin_cache,
+            metadata,
+            16,
+            8,
+            HEAD_DIM,
+            256,
+        )
+        is expected
+    )
 
 
 def reference_attention(
