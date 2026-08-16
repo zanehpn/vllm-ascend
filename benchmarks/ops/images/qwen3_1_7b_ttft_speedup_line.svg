@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="620" viewBox="0 0 1080 620">
+  <rect width="1080" height="620" fill="#F8FAFC"/>
+  <rect x="18" y="18" width="1044" height="584" rx="14" fill="white" stroke="#E7ECF1"/>
+  <text x="62" y="58" fill="#0F172A" font-size="36" font-weight="700" font-family="sans-serif">Qwen3-1.7B TTFT Speedup</text>
+  <text x="62" y="101" fill="#64748B" font-size="19" font-family="sans-serif">Ascend 910B3 · BF16 · All tested lengths remain above 1.0×</text>
+  <line x1="105" y1="487.50" x2="1035" y2="487.50" stroke="#DCE3EA"/>
+  <text x="90" y="493.5" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">1.00×</text>
+  <line x1="105" y1="440.62" x2="1035" y2="440.62" stroke="#DCE3EA"/>
+  <text x="90" y="446.62499999999994" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">1.05×</text>
+  <line x1="105" y1="393.75" x2="1035" y2="393.75" stroke="#DCE3EA"/>
+  <text x="90" y="399.7499999999999" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">1.10×</text>
+  <line x1="105" y1="346.88" x2="1035" y2="346.88" stroke="#DCE3EA"/>
+  <text x="90" y="352.8750000000001" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">1.15×</text>
+  <line x1="105" y1="300.00" x2="1035" y2="300.00" stroke="#DCE3EA"/>
+  <text x="90" y="306.0000000000001" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">1.20×</text>
+  <line x1="105" y1="253.13" x2="1035" y2="253.13" stroke="#DCE3EA"/>
+  <text x="90" y="259.12500000000006" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">1.25×</text>
+  <line x1="105" y1="206.25" x2="1035" y2="206.25" stroke="#DCE3EA"/>
+  <text x="90" y="212.25000000000006" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">1.30×</text>
+  <line x1="105" y1="159.38" x2="1035" y2="159.38" stroke="#DCE3EA"/>
+  <text x="90" y="165.375" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">1.35×</text>
+  <polygon points="105.0,487.50 105.00,338.57 337.50,264.62 570.00,306.44 802.50,300.66 1035.00,319.25 1035.0,487.50" fill="#FDE5D2"/>
+  <line x1="105" y1="487.50" x2="1035" y2="487.50" stroke="#C2413B" stroke-width="2" stroke-dasharray="9 9"/>
+  <polyline points="105.00,338.57 337.50,264.62 570.00,306.44 802.50,300.66 1035.00,319.25" fill="none" stroke="#E87522" stroke-width="4" stroke-linejoin="round"/>
+  <circle cx="105.00" cy="338.57" r="7" fill="white" stroke="#E87522" stroke-width="3"/>
+  <text x="105.0" y="313.56824457035714" fill="#A6450D" font-size="20" font-weight="700" text-anchor="middle" font-family="sans-serif">1.16×</text>
+  <text x="105.0" y="560" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">1</text>
+  <circle cx="337.50" cy="264.62" r="7" fill="white" stroke="#E87522" stroke-width="3"/>
+  <text x="337.5" y="239.6210765932418" fill="#A6450D" font-size="20" font-weight="700" text-anchor="middle" font-family="sans-serif">1.24×</text>
+  <text x="337.5" y="560" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">8</text>
+  <circle cx="570.00" cy="306.44" r="7" fill="white" stroke="#E87522" stroke-width="3"/>
+  <text x="570.0" y="281.4384602169149" fill="#A6450D" font-size="20" font-weight="700" text-anchor="middle" font-family="sans-serif">1.19×</text>
+  <text x="570.0" y="560" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">17</text>
+  <circle cx="802.50" cy="300.66" r="7" fill="white" stroke="#E87522" stroke-width="3"/>
+  <text x="802.5" y="275.65876751522217" fill="#A6450D" font-size="20" font-weight="700" text-anchor="middle" font-family="sans-serif">1.20×</text>
+  <text x="802.5" y="560" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">64</text>
+  <circle cx="1035.00" cy="319.25" r="7" fill="white" stroke="#E87522" stroke-width="3"/>
+  <text x="1035.0" y="294.2537265536357" fill="#A6450D" font-size="20" font-weight="700" text-anchor="middle" font-family="sans-serif">1.18×</text>
+  <text x="1035.0" y="560" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">128</text>
+  <text x="1031" y="473.5" fill="#C2413B" font-size="17" text-anchor="end" font-family="sans-serif">No-regression threshold (1.0×)</text>
+  <text x="570.0" y="590" fill="#334155" font-size="19" text-anchor="middle" font-family="sans-serif">Prefill length (tokens)</text>
+  <text x="27" y="337.5" fill="#334155" font-size="19" text-anchor="middle" font-family="sans-serif" transform="rotate(-90 27 337.5)">Speedup</text>
+</svg>

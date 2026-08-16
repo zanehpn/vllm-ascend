@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="620" viewBox="0 0 1080 620">
+  <rect width="1080" height="620" fill="#F8FAFC"/>
+  <rect x="18" y="18" width="1044" height="584" rx="14" fill="white" stroke="#E7ECF1"/>
+  <text x="62" y="58" fill="#0F172A" font-size="36" font-weight="700" font-family="sans-serif">Qwen3-1.7B TTFT: Baseline vs Optimized</text>
+  <text x="62" y="101" fill="#64748B" font-size="19" font-family="sans-serif">Ascend 910B3 · BF16 · Median of 20 runs · Lower is better</text>
+  <line x1="105" y1="525.00" x2="1035" y2="525.00" stroke="#DCE3EA"/>
+  <text x="90" y="531.0" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">0</text>
+  <line x1="105" y1="462.50" x2="1035" y2="462.50" stroke="#DCE3EA"/>
+  <text x="90" y="468.5" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">25</text>
+  <line x1="105" y1="400.00" x2="1035" y2="400.00" stroke="#DCE3EA"/>
+  <text x="90" y="406.0" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">50</text>
+  <line x1="105" y1="337.50" x2="1035" y2="337.50" stroke="#DCE3EA"/>
+  <text x="90" y="343.5" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">75</text>
+  <line x1="105" y1="275.00" x2="1035" y2="275.00" stroke="#DCE3EA"/>
+  <text x="90" y="281.0" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">100</text>
+  <line x1="105" y1="212.50" x2="1035" y2="212.50" stroke="#DCE3EA"/>
+  <text x="90" y="218.5" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">125</text>
+  <line x1="105" y1="150.00" x2="1035" y2="150.00" stroke="#DCE3EA"/>
+  <text x="90" y="156.0" fill="#64748B" font-size="17" text-anchor="end" font-family="sans-serif">150</text>
+  <rect x="137.00" y="293.52" width="54" height="231.48" rx="4" fill="#64748B"/>
+  <rect x="205.00" y="325.25" width="54" height="199.75" rx="4" fill="#0F9D8A"/>
+  <text x="164.0" y="281.51751747744856" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">92.6</text>
+  <text x="232.0" y="313.2499224821804" fill="#087468" font-size="18" font-weight="700" text-anchor="middle" font-family="sans-serif">79.9</text>
+  <text x="198.0" y="248.51751747744856" fill="#A6450D" font-size="18" font-weight="700" text-anchor="middle" font-family="sans-serif">-13.7%</text>
+  <text x="198.0" y="560" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">1</text>
+  <rect x="323.00" y="279.93" width="54" height="245.07" rx="4" fill="#64748B"/>
+  <rect x="391.00" y="327.00" width="54" height="198.00" rx="4" fill="#0F9D8A"/>
+  <text x="350.0" y="267.9275087294518" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">98.0</text>
+  <text x="418.0" y="314.9996262155473" fill="#087468" font-size="18" font-weight="700" text-anchor="middle" font-family="sans-serif">79.2</text>
+  <text x="384.0" y="234.9275087294518" fill="#A6450D" font-size="18" font-weight="700" text-anchor="middle" font-family="sans-serif">-19.2%</text>
+  <text x="384.0" y="560" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">8</text>
+  <rect x="509.00" y="286.26" width="54" height="238.74" rx="4" fill="#64748B"/>
+  <rect x="577.00" y="324.91" width="54" height="200.09" rx="4" fill="#0F9D8A"/>
+  <text x="536.0" y="274.2634687538957" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">95.5</text>
+  <text x="604.0" y="312.9077475105878" fill="#087468" font-size="18" font-weight="700" text-anchor="middle" font-family="sans-serif">80.0</text>
+  <text x="570.0" y="241.26346875389572" fill="#A6450D" font-size="18" font-weight="700" text-anchor="middle" font-family="sans-serif">-16.2%</text>
+  <text x="570.0" y="560" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">17</text>
+  <rect x="695.00" y="283.48" width="54" height="241.52" rx="4" fill="#64748B"/>
+  <rect x="763.00" y="323.62" width="54" height="201.38" rx="4" fill="#0F9D8A"/>
+  <text x="722.0" y="271.48076504917117" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">96.6</text>
+  <text x="790.0" y="311.6160462460248" fill="#087468" font-size="18" font-weight="700" text-anchor="middle" font-family="sans-serif">80.6</text>
+  <text x="756.0" y="238.48076504917117" fill="#A6450D" font-size="18" font-weight="700" text-anchor="middle" font-family="sans-serif">-16.6%</text>
+  <text x="756.0" y="560" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">64</text>
+  <rect x="881.00" y="288.83" width="54" height="236.17" rx="4" fill="#64748B"/>
+  <rect x="949.00" y="324.76" width="54" height="200.24" rx="4" fill="#0F9D8A"/>
+  <text x="908.0" y="276.8285599896335" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">94.5</text>
+  <text x="976.0" y="312.7635349747725" fill="#087468" font-size="18" font-weight="700" text-anchor="middle" font-family="sans-serif">80.1</text>
+  <text x="942.0" y="243.8285599896335" fill="#A6450D" font-size="18" font-weight="700" text-anchor="middle" font-family="sans-serif">-15.2%</text>
+  <text x="942.0" y="560" fill="#334155" font-size="18" text-anchor="middle" font-family="sans-serif">128</text>
+  <text x="570.0" y="590" fill="#334155" font-size="19" text-anchor="middle" font-family="sans-serif">Prefill length (tokens)</text>
+  <text x="34" y="337.5" fill="#334155" font-size="19" text-anchor="middle" font-family="sans-serif" transform="rotate(-90 34 337.5)">Median TTFT (ms)</text>
+  <rect x="780" y="115" width="21" height="14" fill="#64748B"/>
+  <text x="809" y="129" fill="#334155" font-size="18" font-family="sans-serif">Baseline</text>
+  <rect x="900" y="115" width="21" height="14" fill="#0F9D8A"/>
+  <text x="929" y="129" fill="#334155" font-size="18" font-family="sans-serif">Optimized</text>
+</svg>

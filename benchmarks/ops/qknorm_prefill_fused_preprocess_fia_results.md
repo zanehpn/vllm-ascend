@@ -75,6 +75,28 @@ model layers, logits, sampling, and returning the first generated token.
 No tested eligible length regressed. Ineligible production scenarios do not
 execute the new kernel and therefore retain the established path.
 
+### Qwen3-1.7B TTFT performance
+
+The same end-to-end methodology was also applied to Qwen3-1.7B on one Ascend
+910B3 in BF16 eager mode. Each value is the median of 20 timed runs after three
+warmups.
+
+| Prompt tokens | Baseline TTFT (ms) | Optimized TTFT (ms) | Speedup |
+|---:|---:|---:|---:|
+| 1 | 92.593 | 79.900 | 1.16x |
+| 8 | 98.029 | 79.200 | 1.24x |
+| 17 | 95.495 | 80.037 | 1.19x |
+| 64 | 96.608 | 80.554 | 1.20x |
+| 128 | 94.469 | 80.095 | 1.18x |
+
+All five tested prefill lengths improve. The grouped bars show the absolute
+median TTFT reduction, and the speedup curve remains above the 1.0x
+no-regression threshold at every length.
+
+![Qwen3-1.7B baseline and optimized median TTFT](images/qwen3_1_7b_ttft_grouped_bar.png)
+
+![Qwen3-1.7B TTFT speedup](images/qwen3_1_7b_ttft_speedup_line.png)
+
 ### Qwen3-8B TTFT performance
 
 The same end-to-end methodology was also applied to Qwen3-8B on one Ascend
