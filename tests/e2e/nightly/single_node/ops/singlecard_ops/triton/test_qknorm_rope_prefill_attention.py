@@ -5,6 +5,7 @@ import math
 
 import pytest
 import torch
+import torch_npu
 
 import vllm_ascend.ops  # noqa: F401
 
@@ -187,3 +188,92 @@ def test_qknorm_rope_kv_matches_reference():
 
     torch.testing.assert_close(key, expected_key, rtol=0, atol=0)
     torch.testing.assert_close(value, expected_value.view_as(value), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("chunk_size", [8, 17])
+def test_chunked_kv_cache_then_decode_matches_full_reference(chunk_size: int):
+    """Chunked cache publication must preserve the following decode result."""
+    torch.manual_seed(31)
+    device = torch.device("npu")
+    prompt_len, total_len = 33, 34
+    num_query_heads, num_kv_heads = 16, 8
+    q_size = num_query_heads * HEAD_DIM
+    kv_size = num_kv_heads * HEAD_DIM
+    qkv = torch.randn(
+        total_len, q_size + 2 * kv_size, dtype=torch.bfloat16, device=device
+    )
+    q_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device)
+    k_weight = torch.randn(HEAD_DIM, dtype=torch.bfloat16, device=device)
+    positions = torch.arange(total_len, dtype=torch.int64, device=device)
+    angles = torch.randn(total_len, HEAD_DIM // 2, dtype=torch.float32, device=device)
+    cos_sin_cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(torch.bfloat16)
+    key_cache = torch.zeros(
+        1, 128, num_kv_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+    )
+    value_cache = torch.zeros_like(key_cache)
+    slots = torch.arange(prompt_len, dtype=torch.int32, device=device)
+
+    for start in range(0, prompt_len, chunk_size):
+        end = min(start + chunk_size, prompt_len)
+        torch.ops.vllm.qknorm_rope_kv_cache(
+            qkv[start:end],
+            k_weight,
+            cos_sin_cache,
+            positions[start:end],
+            key_cache,
+            value_cache,
+            slots[start:end],
+            num_query_heads,
+            num_kv_heads,
+            1e-6,
+        )
+
+    decode_key, decode_value = torch.ops.vllm.qknorm_rope_kv(
+        qkv[-1:],
+        k_weight,
+        cos_sin_cache,
+        positions[-1:],
+        num_query_heads,
+        num_kv_heads,
+        1e-6,
+    )
+    raw_q = qkv[-1:, :q_size].view(1, num_query_heads, HEAD_DIM).float()
+    decode_q = (
+        raw_q
+        * torch.rsqrt(raw_q.square().mean(dim=-1, keepdim=True) + 1e-6)
+        * q_weight.float()
+    ).to(torch.bfloat16)
+    cos, sin = cos_sin_cache[positions[-1:]].float().chunk(2, dim=-1)
+    first, second = decode_q.float().chunk(2, dim=-1)
+    decode_q = torch.cat(
+        (
+            first * cos[:, None] - second * sin[:, None],
+            second * cos[:, None] + first * sin[:, None],
+        ),
+        dim=-1,
+    ).to(torch.bfloat16)
+    cached_key = key_cache.view(-1, num_kv_heads, HEAD_DIM)[:prompt_len]
+    cached_value = value_cache.view(-1, num_kv_heads, HEAD_DIM)[:prompt_len]
+    actual = torch_npu.npu_fused_infer_attention_score(
+        query=decode_q,
+        key=torch.cat((cached_key, decode_key), dim=0),
+        value=torch.cat((cached_value, decode_value), dim=0),
+        input_layout="TND",
+        actual_seq_lengths=[1],
+        actual_seq_lengths_kv=[total_len],
+        num_heads=num_query_heads,
+        num_key_value_heads=num_kv_heads,
+        sparse_mode=0,
+        scale=1.0 / math.sqrt(HEAD_DIM),
+    )[0]
+    expected = reference_attention(
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        num_query_heads,
+        num_kv_heads,
+        1e-6,
+    )[-1:]
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)

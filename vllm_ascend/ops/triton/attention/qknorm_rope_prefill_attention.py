@@ -82,6 +82,79 @@ def qknorm_rope_kv_kernel(
 
 
 @triton.jit
+def qknorm_rope_kv_cache_kernel(
+    qkv_ptr,
+    k_weight_ptr,
+    cos_sin_cache_ptr,
+    positions_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    slot_mapping_ptr,
+    seq_len: tl.constexpr,
+    q_hidden_size: tl.constexpr,
+    kv_hidden_size: tl.constexpr,
+    total_hidden_size: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    eps: tl.constexpr,
+):
+    """Normalize/rotate K once and publish K/V in the paged-cache layout."""
+    program_id = tl.program_id(0)
+    token = program_id // num_kv_heads
+    kv_head = program_id % num_kv_heads
+    dims = tl.arange(0, HEAD_DIM)
+    half_dims = dims % HALF_HEAD_DIM
+    valid = token < seq_len
+    slot = tl.load(slot_mapping_ptr + token, mask=valid, other=-1)
+    cache_valid = valid & (slot >= 0)
+
+    k_base = token * total_hidden_size + q_hidden_size + kv_head * HEAD_DIM
+    k_raw = tl.load(qkv_ptr + k_base + dims, mask=valid, other=0.0).to(tl.float32)
+    k_inv_rms = 1.0 / tl.sqrt(tl.sum(k_raw * k_raw, axis=0) / HEAD_DIM + eps)
+    k_first = (
+        tl.load(qkv_ptr + k_base + half_dims, mask=valid, other=0.0).to(tl.float32)
+        * k_inv_rms
+        * tl.load(k_weight_ptr + half_dims).to(tl.float32)
+    ).to(tl.bfloat16)
+    k_second = (
+        tl.load(
+            qkv_ptr + k_base + half_dims + HALF_HEAD_DIM,
+            mask=valid,
+            other=0.0,
+        ).to(tl.float32)
+        * k_inv_rms
+        * tl.load(k_weight_ptr + half_dims + HALF_HEAD_DIM).to(tl.float32)
+    ).to(tl.bfloat16)
+    position = tl.load(positions_ptr + token, mask=valid, other=0)
+    rope_base = position * HEAD_DIM + half_dims
+    cosine = tl.load(
+        cos_sin_cache_ptr + rope_base, mask=valid, other=0.0
+    ).to(tl.float32)
+    sine = tl.load(
+        cos_sin_cache_ptr + rope_base + HALF_HEAD_DIM,
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
+    key = tl.where(
+        dims < HALF_HEAD_DIM,
+        k_first * cosine - k_second * sine,
+        k_second * cosine + k_first * sine,
+    ).to(tl.bfloat16)
+
+    value_base = (
+        token * total_hidden_size
+        + q_hidden_size
+        + kv_hidden_size
+        + kv_head * HEAD_DIM
+    )
+    value = tl.load(qkv_ptr + value_base + dims, mask=valid, other=0.0)
+    cache_offset = (
+        slot * num_kv_heads * HEAD_DIM + kv_head * HEAD_DIM + dims
+    )
+    tl.store(key_cache_ptr + cache_offset, key, mask=cache_valid)
+    tl.store(value_cache_ptr + cache_offset, value, mask=cache_valid)
+
+
+@triton.jit
 def qknorm_rope_prefill_attention_kernel(
     qkv_ptr,
     q_weight_ptr,
@@ -103,6 +176,7 @@ def qknorm_rope_prefill_attention_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     STORE_CACHE: tl.constexpr,
+    LOAD_CACHE: tl.constexpr,
 ):
     program_id = tl.program_id(0)
     query_block = program_id // num_kv_heads
@@ -167,47 +241,72 @@ def qknorm_rope_prefill_attention_kernel(
     for key_start in tl.range(0, seq_len, BLOCK_N):
         cols = key_start + tl.arange(0, BLOCK_N)
         col_mask = cols < seq_len
-        k_base = cols[:, None] * total_hidden_size + q_hidden_size + kv_head * HEAD_DIM
-
-        k_raw = tl.load(qkv_ptr + k_base + dims[None, :], mask=col_mask[:, None], other=0.0)
-        k_fp32 = k_raw.to(tl.float32)
-        k_inv_rms = 1.0 / tl.sqrt(tl.sum(k_fp32 * k_fp32, axis=1) / HEAD_DIM + eps)
-
-        k_first = tl.load(
-            qkv_ptr + k_base + half_dims[None, :],
-            mask=col_mask[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        k_second = tl.load(
-            qkv_ptr + k_base + half_dims[None, :] + HALF_HEAD_DIM,
-            mask=col_mask[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        k_first = (
-            k_first
-            * k_inv_rms[:, None]
-            * tl.load(k_weight_ptr + half_dims)[None, :].to(tl.float32)
-        ).to(tl.bfloat16)
-        k_second = (
-            k_second
-            * k_inv_rms[:, None]
-            * tl.load(k_weight_ptr + half_dims + HALF_HEAD_DIM)[None, :].to(tl.float32)
-        ).to(tl.bfloat16)
-
-        k_positions = tl.load(positions_ptr + cols, mask=col_mask, other=0)
-        k_cache_base = k_positions[:, None] * HEAD_DIM + half_dims[None, :]
-        k_cos = tl.load(cos_sin_cache_ptr + k_cache_base, mask=col_mask[:, None], other=0.0).to(tl.float32)
-        k_sin = tl.load(
-            cos_sin_cache_ptr + k_cache_base + HALF_HEAD_DIM,
-            mask=col_mask[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        k_rotated = tl.where(
-            dims[None, :] < HALF_HEAD_DIM,
-            k_first * k_cos - k_second * k_sin,
-            k_second * k_cos + k_first * k_sin,
-        )
-        k = k_rotated.to(tl.bfloat16)
+        if LOAD_CACHE:
+            slots = tl.load(slot_mapping_ptr + cols, mask=col_mask, other=-1)
+            cache_mask = col_mask[:, None] & (slots[:, None] >= 0)
+            cache_offset = (
+                slots[:, None] * num_kv_heads * HEAD_DIM
+                + kv_head * HEAD_DIM
+                + dims[None, :]
+            )
+            k = tl.load(
+                key_cache_ptr + cache_offset, mask=cache_mask, other=0.0
+            )
+        else:
+            k_base = (
+                cols[:, None] * total_hidden_size
+                + q_hidden_size
+                + kv_head * HEAD_DIM
+            )
+            k_raw = tl.load(
+                qkv_ptr + k_base + dims[None, :],
+                mask=col_mask[:, None],
+                other=0.0,
+            )
+            k_fp32 = k_raw.to(tl.float32)
+            k_inv_rms = 1.0 / tl.sqrt(
+                tl.sum(k_fp32 * k_fp32, axis=1) / HEAD_DIM + eps
+            )
+            k_first = tl.load(
+                qkv_ptr + k_base + half_dims[None, :],
+                mask=col_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            k_second = tl.load(
+                qkv_ptr + k_base + half_dims[None, :] + HALF_HEAD_DIM,
+                mask=col_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            k_first = (
+                k_first
+                * k_inv_rms[:, None]
+                * tl.load(k_weight_ptr + half_dims)[None, :].to(tl.float32)
+            ).to(tl.bfloat16)
+            k_second = (
+                k_second
+                * k_inv_rms[:, None]
+                * tl.load(k_weight_ptr + half_dims + HALF_HEAD_DIM)[None, :].to(
+                    tl.float32
+                )
+            ).to(tl.bfloat16)
+            k_positions = tl.load(positions_ptr + cols, mask=col_mask, other=0)
+            k_cache_base = k_positions[:, None] * HEAD_DIM + half_dims[None, :]
+            k_cos = tl.load(
+                cos_sin_cache_ptr + k_cache_base,
+                mask=col_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            k_sin = tl.load(
+                cos_sin_cache_ptr + k_cache_base + HALF_HEAD_DIM,
+                mask=col_mask[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            k_rotated = tl.where(
+                dims[None, :] < HALF_HEAD_DIM,
+                k_first * k_cos - k_second * k_sin,
+                k_second * k_cos + k_first * k_sin,
+            )
+            k = k_rotated.to(tl.bfloat16)
 
         scores = tl.dot(q, tl.trans(k), input_precision="ieee") * softmax_scale
         causal_mask = col_mask[None, :] & row_mask[:, None] & (cols[None, :] <= rows[:, None])
@@ -224,17 +323,22 @@ def qknorm_rope_prefill_attention_kernel(
         probabilities = tl.exp(scores - new_max[:, None])
         block_sum = tl.sum(probabilities, axis=1)
 
-        v_base = (
-            cols[:, None] * total_hidden_size
-            + q_hidden_size
-            + kv_hidden_size
-            + kv_head * HEAD_DIM
-        )
-        value = tl.load(
-            qkv_ptr + v_base + dims[None, :],
-            mask=col_mask[:, None],
-            other=0.0,
-        )
+        if LOAD_CACHE:
+            value = tl.load(
+                value_cache_ptr + cache_offset, mask=cache_mask, other=0.0
+            )
+        else:
+            v_base = (
+                cols[:, None] * total_hidden_size
+                + q_hidden_size
+                + kv_hidden_size
+                + kv_head * HEAD_DIM
+            )
+            value = tl.load(
+                qkv_ptr + v_base + dims[None, :],
+                mask=col_mask[:, None],
+                other=0.0,
+            )
         if STORE_CACHE:
             # The cache layout is [num_blocks, block_size, KV heads, D].
             # A flattened slot therefore addresses one [KV heads, D] row.
@@ -327,6 +431,7 @@ def qknorm_rope_prefill_attention_impl(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         STORE_CACHE=False,
+        LOAD_CACHE=False,
         num_warps=4,
         num_stages=2,
     )
@@ -364,6 +469,18 @@ def qknorm_rope_prefill_attention_with_cache_impl(
     block_m = 8 if num_query_heads // num_kv_heads == 4 else 16
     block_n = 32
     grid = (triton.cdiv(seq_len, block_m) * num_kv_heads, 1, 1)
+    qknorm_rope_kv_cache_impl(
+        qkv,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        num_query_heads,
+        num_kv_heads,
+        eps,
+    )
     qknorm_rope_prefill_attention_kernel[grid](
         qkv,
         q_weight,
@@ -384,11 +501,72 @@ def qknorm_rope_prefill_attention_with_cache_impl(
         scale,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
-        STORE_CACHE=True,
+        STORE_CACHE=False,
+        LOAD_CACHE=True,
         num_warps=4,
         num_stages=2,
     )
     return output
+
+
+def qknorm_rope_kv_cache_impl(
+    qkv: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    num_query_heads: int,
+    num_kv_heads: int,
+    eps: float,
+) -> None:
+    """Write normalized/rotated K and raw V directly to the paged cache."""
+    q_hidden_size = num_query_heads * HEAD_DIM
+    kv_hidden_size = num_kv_heads * HEAD_DIM
+    total_hidden_size = q_hidden_size + 2 * kv_hidden_size
+    if qkv.dtype != torch.bfloat16 or qkv.ndim != 2:
+        raise ValueError("qkv must be a 2D bfloat16 tensor")
+    if qkv.shape[1] != total_hidden_size:
+        raise ValueError(f"qkv hidden size must be {total_hidden_size}")
+    if key_cache.dtype != qkv.dtype or value_cache.dtype != qkv.dtype:
+        raise ValueError("QKV and KV cache must be bfloat16")
+    if slot_mapping.ndim != 1 or slot_mapping.shape[0] < qkv.shape[0]:
+        raise ValueError("slot_mapping must contain one slot per token")
+    grid = (qkv.shape[0] * num_kv_heads, 1, 1)
+    qknorm_rope_kv_cache_kernel[grid](
+        qkv,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        qkv.shape[0],
+        q_hidden_size,
+        kv_hidden_size,
+        total_hidden_size,
+        num_kv_heads,
+        eps,
+        num_warps=4,
+        num_stages=1,
+    )
+
+
+def qknorm_rope_kv_cache_fake(
+    qkv: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    num_query_heads: int,
+    num_kv_heads: int,
+    eps: float,
+) -> None:
+    del qkv, k_weight, cos_sin_cache, positions, key_cache, value_cache
+    del slot_mapping, num_query_heads, num_kv_heads, eps
 
 
 def qknorm_rope_prefill_attention_with_cache_fake(
@@ -498,6 +676,14 @@ direct_register_custom_op(
     op_func=qknorm_rope_kv_impl,
     fake_impl=qknorm_rope_kv_fake,
     mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
+
+direct_register_custom_op(
+    op_name="qknorm_rope_kv_cache",
+    op_func=qknorm_rope_kv_cache_impl,
+    fake_impl=qknorm_rope_kv_cache_fake,
+    mutates_args=["key_cache", "value_cache"],
     dispatch_key="PrivateUse1",
 )
 
